@@ -1,0 +1,25 @@
+{
+  "domain": "powerguesser",
+  "name": "PowerGuesser",
+  "categories": [
+    "energy.meters_monitoring"
+  ],
+  "codeowners": [
+    "@hrabbach"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "energy",
+    "recorder"
+  ],
+  "documentation": "https://github.com/hrabbach/ha-powerguesser",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/hrabbach/ha-powerguesser/issues",
+  "requirements": [
+    "numpy",
+    "scipy>=1.16.2,<2"
+  ],
+  "single_config_entry": true,
+  "version": "0.2.0"
+}

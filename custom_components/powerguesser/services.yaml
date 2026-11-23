@@ -1,0 +1,17 @@
+learn:
+  name: Learn devices
+  description: Starts a learning run in the background. Needs an LLM endpoint, a confirmed data-sharing notice and at least 7 days of usable history.
+preview_learning_payload:
+  name: Preview learning payload
+  description: Returns the exact request body that the next learning run would send to the LLM endpoint, without sending anything. The API key and headers are never included.
+run_validation:
+  name: Run validation
+  description: Measures each plug-metered device's estimate against its own plug readings over the most recent holdout window and returns the report. Runs locally, sends nothing to the LLM.
+  fields:
+    synthetic_overlap:
+      name: Add synthetic overlap
+      description: Adds a clearly labelled synthetic overlap block by time-shifting one plug onto another. Real figures are not changed.
+      required: false
+      default: false
+      selector:
+        boolean:

@@ -1,0 +1,129 @@
+{
+  "ok_with_cost_header": {
+    "status": 200,
+    "headers": {
+      "x-litellm-response-cost": "0.00042"
+    },
+    "json": {
+      "id": "chatcmpl-test",
+      "object": "chat.completion",
+      "created": 1700000000,
+      "model": "m1-2026",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"status\":\"completed\"}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "total_tokens": 110
+      }
+    }
+  },
+  "error_500": {
+    "status": 500,
+    "json": {
+      "error": {
+        "message": "Internal server error occurred",
+        "type": "server_error",
+        "code": "500"
+      }
+    }
+  },
+  "throttle_429": {
+    "status": 429,
+    "headers": {
+      "Retry-After": "1"
+    },
+    "json": {
+      "error": {
+        "message": "Rate limit reached. Please slow down.",
+        "type": "throttling_error",
+        "code": "429"
+      }
+    }
+  },
+  "budget_429": {
+    "status": 429,
+    "json": {
+      "error": {
+        "message": "Monthly proxy budget of $10.00 exceeded",
+        "type": "budget_exceeded",
+        "param": null,
+        "code": "429"
+      }
+    }
+  },
+  "bad_400": {
+    "status": 400,
+    "json": {
+      "error": {
+        "message": "Invalid request parameters provided",
+        "type": "invalid_request_error",
+        "code": "400"
+      }
+    }
+  },
+  "unauthorized_401": {
+    "status": 401,
+    "json": {
+      "error": {
+        "message": "Incorrect API key provided",
+        "type": "invalid_api_key",
+        "code": "401"
+      }
+    }
+  },
+  "forbidden_403": {
+    "status": 403,
+    "json": {
+      "error": {
+        "message": "Access forbidden for this model",
+        "type": "permission_denied",
+        "code": "403"
+      }
+    }
+  },
+  "not_found_404": {
+    "status": 404,
+    "json": {
+      "error": {
+        "message": "The model m1 does not exist",
+        "type": "not_found",
+        "code": "404"
+      }
+    }
+  },
+  "unprocessable_422": {
+    "status": 422,
+    "json": {
+      "error": {
+        "message": "Unprocessable entity payload",
+        "type": "unprocessable_entity",
+        "code": "422"
+      }
+    }
+  },
+  "too_large": {
+    "status": 200,
+    "text": "OVERSIZED_PAYLOAD_SENTINEL"
+  },
+  "not_json": {
+    "status": 200,
+    "text": "<html>502 Bad Gateway</html>"
+  },
+  "no_choices": {
+    "status": 200,
+    "json": {
+      "id": "chatcmpl-test",
+      "model": "m1-2026",
+      "choices": []
+    }
+  }
+}

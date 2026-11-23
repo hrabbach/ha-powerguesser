@@ -1,0 +1,10 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-p no:respx"
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "slow: spawns the real worker subprocess (seconds per test); deselect with -m 'not slow' for a fast local loop",
+]
+

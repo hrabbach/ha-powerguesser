@@ -1,0 +1,226 @@
+{
+  "standard": {
+    "energy_sources": [
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_import_energy",
+        "stat_rate": "sensor.grid_power"
+      },
+      {
+        "type": "solar",
+        "stat_energy_from": "sensor.solar_energy",
+        "stat_rate": "sensor.solar_power"
+      },
+      {
+        "type": "battery",
+        "stat_energy_from": "sensor.battery_energy_out",
+        "stat_rate": "sensor.battery_power"
+      }
+    ],
+    "device_consumption": []
+  },
+  "power_config_standard": {
+    "energy_sources": [
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_import_energy",
+        "power_config": {
+          "stat_rate": "sensor.grid_power"
+        }
+      }
+    ],
+    "device_consumption": []
+  },
+  "inverted": {
+    "energy_sources": [
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_import_energy",
+        "power_config": {
+          "stat_rate_inverted": "sensor.grid_export_power"
+        }
+      }
+    ],
+    "device_consumption": []
+  },
+  "two_sensor": {
+    "energy_sources": [
+      {
+        "type": "battery",
+        "stat_energy_from": "sensor.battery_energy_out",
+        "power_config": {
+          "stat_rate_from": "sensor.battery_discharge_power",
+          "stat_rate_to": "sensor.battery_charge_power"
+        }
+      }
+    ],
+    "device_consumption": []
+  },
+  "mixed_shape": {
+    "energy_sources": [
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_import_energy",
+        "power_config": {
+          "stat_rate": "sensor.grid_power",
+          "stat_rate_inverted": "sensor.grid_export_power"
+        }
+      }
+    ],
+    "device_consumption": []
+  },
+  "extra_key": {
+    "energy_sources": [
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_import_energy",
+        "power_config": {
+          "stat_rate": "sensor.grid_power",
+          "unknown_key": "sensor.other"
+        }
+      }
+    ],
+    "device_consumption": []
+  },
+  "from_without_to": {
+    "energy_sources": [
+      {
+        "type": "battery",
+        "stat_energy_from": "sensor.battery_energy_out",
+        "power_config": {
+          "stat_rate_from": "sensor.battery_discharge_power"
+        }
+      }
+    ],
+    "device_consumption": []
+  },
+  "empty_power_config_with_stat_rate": {
+    "energy_sources": [
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_import_energy",
+        "stat_rate": "sensor.grid_power",
+        "power_config": {}
+      }
+    ],
+    "device_consumption": []
+  },
+  "missing_stat_rate_grid": {
+    "energy_sources": [
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_import_energy"
+      }
+    ],
+    "device_consumption": []
+  },
+  "missing_stat_rate_solar": {
+    "energy_sources": [
+      {
+        "type": "solar",
+        "stat_energy_from": "sensor.solar_energy"
+      }
+    ],
+    "device_consumption": []
+  },
+  "home_source": {
+    "energy_sources": [
+      {
+        "type": "home",
+        "stat_energy_to": "sensor.home_consumption_energy",
+        "stat_rate": "sensor.home_power"
+      },
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_import_energy"
+      }
+    ],
+    "device_consumption": []
+  },
+  "home_without_stat_rate": {
+    "energy_sources": [
+      {
+        "type": "home",
+        "stat_energy_to": "sensor.home_consumption_energy"
+      },
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_import_energy",
+        "stat_rate": "sensor.grid_power"
+      }
+    ],
+    "device_consumption": []
+  },
+  "multi_grid": {
+    "energy_sources": [
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_a_energy",
+        "stat_rate": "sensor.grid_a_power"
+      },
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_b_energy",
+        "stat_rate": "sensor.grid_b_power"
+      }
+    ],
+    "device_consumption": []
+  },
+  "multi_grid_reordered": {
+    "energy_sources": [
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_b_energy",
+        "stat_rate": "sensor.grid_b_power"
+      },
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_a_energy",
+        "stat_rate": "sensor.grid_a_power"
+      }
+    ],
+    "device_consumption": []
+  },
+  "own_device_energy": {
+    "energy_sources": [
+      {
+        "type": "grid",
+        "stat_energy_from": "sensor.grid_import_energy",
+        "stat_rate": "sensor.grid_power"
+      },
+      {
+        "type": "solar",
+        "stat_energy_from": "sensor.solar_energy",
+        "stat_rate": "sensor.solar_power"
+      },
+      {
+        "type": "battery",
+        "stat_energy_from": "sensor.battery_energy_out",
+        "stat_rate": "sensor.battery_power"
+      }
+    ],
+    "device_consumption": [
+      {
+        "stat_consumption": "sensor.foreign_plug_energy",
+        "name": "Foreign Plug"
+      },
+      {
+        "stat_consumption": "sensor.oven_energy",
+        "name": "Oven"
+      }
+    ]
+  },
+  "no_sources": {
+    "energy_sources": [],
+    "device_consumption": []
+  },
+  "gas_only": {
+    "energy_sources": [
+      {
+        "type": "gas",
+        "stat_energy_from": "sensor.gas_consumption"
+      }
+    ],
+    "device_consumption": []
+  }
+}

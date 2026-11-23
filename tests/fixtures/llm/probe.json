@@ -1,0 +1,176 @@
+{
+  "json_schema_ok": {
+    "status": 200,
+    "json": {
+      "id": "chatcmpl-test",
+      "object": "chat.completion",
+      "created": 1700000000,
+      "model": "m1-2026",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"ok\":true,\"word\":\"pong\",\"n\":7}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 61,
+        "completion_tokens": 9,
+        "total_tokens": 70
+      }
+    }
+  },
+  "schema_ignored": {
+    "status": 200,
+    "json": {
+      "id": "chatcmpl-test",
+      "object": "chat.completion",
+      "created": 1700000000,
+      "model": "m1-2026",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Hello! I am answering in plain English: ok is true, word is pong, n is 7."
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 61,
+        "completion_tokens": 15,
+        "total_tokens": 76
+      }
+    }
+  },
+  "tool_call_ok": {
+    "status": 200,
+    "json": {
+      "id": "chatcmpl-test",
+      "object": "chat.completion",
+      "created": 1700000000,
+      "model": "m1-tool",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call_123",
+                "type": "function",
+                "function": {
+                  "name": "submit",
+                  "arguments": "{\"ok\":true,\"word\":\"pong\",\"n\":7}"
+                }
+              }
+            ]
+          },
+          "finish_reason": "tool_calls"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 75,
+        "completion_tokens": 12,
+        "total_tokens": 87
+      }
+    }
+  },
+  "json_object_ok": {
+    "status": 200,
+    "json": {
+      "id": "chatcmpl-test",
+      "object": "chat.completion",
+      "created": 1700000000,
+      "model": "m1-json-object",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"ok\":true,\"word\":\"pong\",\"n\":7}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 65,
+        "completion_tokens": 9,
+        "total_tokens": 74
+      }
+    }
+  },
+  "fenced_ok": {
+    "status": 200,
+    "json": {
+      "id": "chatcmpl-test",
+      "object": "chat.completion",
+      "created": 1700000000,
+      "model": "m1-fenced",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "Here is the requested output:\n```json\n{\"ok\":true,\"word\":\"pong\",\"n\":7}\n```\nHope this helps!"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 80,
+        "completion_tokens": 20,
+        "total_tokens": 100
+      }
+    }
+  },
+  "bad_param_max_completion_tokens": {
+    "status": 400,
+    "json": {
+      "error": {
+        "message": "Unsupported parameter: 'max_completion_tokens'",
+        "type": "invalid_request_error",
+        "param": "max_completion_tokens",
+        "code": "400"
+      }
+    }
+  },
+  "bad_param_temperature": {
+    "status": 400,
+    "json": {
+      "error": {
+        "message": "Unsupported parameter: 'temperature'",
+        "type": "invalid_request_error",
+        "param": "temperature",
+        "code": "400"
+      }
+    }
+  },
+  "unsupported_response_format": {
+    "status": 400,
+    "json": {
+      "error": {
+        "message": "Unsupported response_format",
+        "type": "invalid_request_error",
+        "param": null,
+        "code": "400"
+      }
+    }
+  },
+  "unauthorized": {
+    "status": 401,
+    "json": {
+      "error": {
+        "message": "Invalid API key",
+        "type": "auth_error",
+        "param": null,
+        "code": "401"
+      }
+    }
+  }
+}

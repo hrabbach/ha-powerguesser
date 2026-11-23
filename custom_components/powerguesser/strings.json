@@ -1,0 +1,539 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up PowerGuesser",
+        "description": "PowerGuesser derives live power and unexplained remainder from your Energy dashboard.\n\nDetected gross power sources: {gross_sources}\nDetected metered devices: {metered_count}\n\nNote that the sign self-check needs up to about 45 minutes of data before it can flag a problem."
+      }
+    },
+    "abort": {
+      "no_energy_prefs": "No grid, solar, battery, or home power source is configured in the Energy dashboard. Configure one in the Energy dashboard, then try again.",
+      "missing_stat_rate": "The energy source {source} does not have a power rate sensor configured. Configure a power sensor in the Energy dashboard, then try again.",
+      "unsupported_power_config": "The energy source {source} has an unsupported power configuration. Check the power sensor configuration in the Energy dashboard, then try again.",
+      "source_not_found": "The power entity for {source} cannot be found in Home Assistant. Verify the entity in the Energy dashboard, then try again.",
+      "invalid_unit": "The power entity for {source} does not have a valid power unit of measurement (such as W or kW). Check the entity in the Energy dashboard, then try again.",
+      "single_instance_allowed": "Only a single instance of PowerGuesser is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "PowerGuesser options",
+        "menu_options": {
+          "phases": "Per-phase power (L1/L2/L3)",
+          "llm_endpoint": "LLM endpoint",
+          "learning": "Learning",
+          "review": "Review candidates",
+          "plug_sessions": "Plug sessions"
+        }
+      },
+      "plug_sessions": {
+        "title": "Plug sessions",
+        "menu_options": {
+          "session_start": "Start a plug session",
+          "session_end": "End a plug session",
+          "session_list": "List plug sessions"
+        }
+      },
+      "session_start": {
+        "title": "Start a plug session",
+        "description": "Move a smart plug onto the device you want to teach. While the session is active, a candidate target's plug reading is subtracted from the remainder; a confirmed device's own sensors and validation keep running and the plug is recorded for the session window.\n\nThe session stays open until you end it, or automatically on the end date you set. Earlier sessions are never changed when the plug moves on.",
+        "data": {
+          "plug": "Smart plug power sensor",
+          "target": "Target",
+          "end_date": "End date (optional)"
+        },
+        "data_description": {
+          "plug": "Any power sensor that is not already an Energy dashboard source or metered device.",
+          "target": "A candidate from the last learning run, or a confirmed device.",
+          "end_date": "The session ends automatically at this date and time. Leave empty to end it by hand."
+        }
+      },
+      "session_list": {
+        "title": "Plug sessions",
+        "description": "{sessions}"
+      },
+      "session_end": {
+        "title": "End a plug session",
+        "description": "Ending the session stops subtracting its plug from the remainder and closes the recorded window. Its earlier data stays in the buffer.",
+        "data": {
+          "session": "Plug session"
+        }
+      },
+      "review": {
+        "title": "Review device candidates",
+        "description": "Candidates from the last learning run, ranked by the share of unexplained energy they explain. The figures are local consistency checks on training and validation days; measured accuracy against real plug readings comes in a later version. Pick a candidate, then close the dialog when you are done.",
+        "data": {
+          "candidate": "Candidate"
+        }
+      },
+      "candidate": {
+        "title": "Candidate",
+        "description": "{candidate}",
+        "menu_options": {
+          "confirm": "Confirm as device",
+          "rename": "Name it",
+          "merge": "Merge other candidates into it",
+          "dismiss": "Dismiss it"
+        }
+      },
+      "device": {
+        "title": "Confirmed device",
+        "description": "{candidate}",
+        "menu_options": {
+          "accept_update": "Accept the proposed update",
+          "rollback": "Restore an earlier parameter version",
+          "merge": "Merge another confirmed device into it",
+          "rename": "Rename it"
+        }
+      },
+      "rollback": {
+        "title": "Restore parameter version",
+        "description": "{candidate}\n\nThe device keeps its sensors, entity IDs and energy total; only the detection parameters change.",
+        "data": {
+          "version": "Parameter version"
+        }
+      },
+      "confirm": {
+        "title": "Confirm device",
+        "description": "{candidate}{warning}\n\nConfirming creates a device with power and energy sensors that PowerGuesser estimates locally.",
+        "data": {
+          "name": "Device name"
+        }
+      },
+      "rename": {
+        "title": "Name candidate",
+        "description": "{candidate}{first_seen}",
+        "data": {
+          "name": "Name"
+        }
+      },
+      "merge": {
+        "title": "Merge candidates",
+        "description": "The selected candidates are combined into {candidate}. They will no longer be listed, and later learning runs map them to this candidate. The shares and scores shown update at the next learning run. A merged confirmed device is retired: its energy sensor keeps its last value and its power sensor becomes unavailable. Delete it under Settings when you no longer need its history. Merging a candidate into a confirmed device retrains the device locally in the background; the new parameters are kept only if they are at least as good, and the device keeps its sensors and history either way.",
+        "data": {
+          "sources": "Candidates to merge into this one"
+        }
+      },
+      "learning": {
+        "title": "Learning options",
+        "description": "Configure token caps, cost limits, schedule, and data sharing for PowerGuesser device learning.",
+        "data": {
+          "share_entity_names": "Include device names in prompt",
+          "max_tokens_per_call": "Max completion tokens per call",
+          "run_input_tokens": "Per-run input token cap",
+          "run_output_tokens": "Per-run output token cap",
+          "month_input_tokens": "Monthly input token cap",
+          "month_output_tokens": "Monthly output token cap",
+          "price_input_per_1m": "Input token price per 1M (optional)",
+          "price_output_per_1m": "Output token price per 1M (optional)",
+          "month_cost_limit": "Monthly cost limit (optional)",
+          "schedule": "Learning schedule",
+          "schedule_weekday": "Weekday",
+          "schedule_time": "Time",
+          "truncation_guard": "Silent truncation guard",
+          "validate_after_learning": "Validate after each learning run"
+        },
+        "data_description": {
+          "share_entity_names": "When enabled, names and areas of metered plugs are sent to the LLM to improve candidate labels.",
+          "max_tokens_per_call": "Upper limit for one LLM reply. Reasoning models spend hidden reasoning tokens inside this limit; if learning fails with output_truncated, raise it (the default 32000 suits reasoning models).",
+          "schedule": "When to trigger learning automatically.",
+          "truncation_guard": "Abort and notify if the endpoint reports implausibly few prompt tokens for the payload size.",
+          "validate_after_learning": "Runs the local holdout validation after every successful learning run. It sends nothing to the LLM."
+        }
+      },
+      "phases": {
+        "title": "Per-phase power (optional)",
+        "description": "If your energy meter provides active power for individual grid phases (L1, L2, L3), you may map one to three phases here to record and profile per-phase data. Leave a field empty to clear that phase mapping. Gross and remainder power keep using total power either way.\n\nPower sensors on your grid meter's device: {grid_device_sensors}",
+        "data": {
+          "phase_l1": "Phase L1 power",
+          "phase_l2": "Phase L2 power",
+          "phase_l3": "Phase L3 power"
+        }
+      },
+      "llm_endpoint": {
+        "title": "LLM endpoint",
+        "description": "PowerGuesser uses an OpenAI-compatible endpoint only to learn device patterns; day-to-day detection stays local. Enter the base URL (ending in /v1), the API key if the endpoint needs one, and the model id.\n\nSaving runs a short capability test that sends only a fixed test prompt, no household data, and stores which structured-output method the endpoint supports. Leave the base URL empty to disable learning.",
+        "data": {
+          "llm_base_url": "Base URL",
+          "llm_api_key": "API key",
+          "llm_model": "Model",
+          "llm_clear_key": "Remove the stored API key"
+        },
+        "data_description": {
+          "llm_api_key": "Leave empty to keep the stored key. The stored key is kept only while the scheme, host and port stay the same; otherwise enter it again. Most local servers need no key.",
+          "llm_clear_key": "Turn on to save the endpoint without an API key. A key typed above is still used."
+        }
+      },
+      "phase_check": {
+        "title": "Check phase mapping",
+        "description": "The mapped phases add up to {phase_sum} W while grid power reads {grid} W (result: {result}).\n\nThe comparison uses each sensor's latest reading, which can be up to a minute old on slow meters, so a mismatch right after a load change is expected. Re-opening the dialog later gives a fresh comparison. A sum close to the negative of grid power means the phase sensors use the opposite sign and Invert phase sign should be on. Mapping only some phases of a three-phase supply makes a mismatch expected. The mapping can be saved either way.",
+        "data": {
+          "invert_phases": "Invert phase sign"
+        }
+      }
+    },
+    "progress": {
+      "probe": "Testing the endpoint. Slow local models can take a minute or more."
+    },
+    "error": {
+      "duplicate_phase": "The same sensor is mapped to more than one phase.",
+      "phase_self_reference": "PowerGuesser's own sensors cannot be used as phase power.",
+      "phase_is_source": "This sensor is already an Energy dashboard source or metered device.",
+      "invalid_url": "Enter an http or https URL without user name, password, query or fragment.",
+      "model_required": "Enter the model id.",
+      "invalid_auth": "The endpoint rejected the API key.",
+      "cannot_connect": "The endpoint could not be reached.",
+      "model_unusable": "The model did not return valid structured output with any supported method.",
+      "cost_limit_needs_prices": "Monthly cost limit requires both input and output token prices to be set.",
+      "max_tokens_above_run_cap": "Per-call max tokens cannot exceed the per-run output token cap.",
+      "candidate_gone": "This candidate is no longer available because a learning run replaced it. Pick again.",
+      "target_gone": "That no longer targets anything. Pick again.",
+      "plug_self_reference": "PowerGuesser's own sensors cannot be used as a plug.",
+      "plug_is_source": "This sensor is already an Energy dashboard source or metered device, so it would be subtracted twice.",
+      "plug_in_session": "This plug is already used by an active plug session. End that session first.",
+      "end_date_past": "The end date must be in the future.",
+      "name_invalid": "Enter a name of 1 to 64 characters without control characters."
+    },
+    "abort": {
+      "not_loaded": "PowerGuesser is not running. Reload the integration, then try again.",
+      "no_candidates": "There are no candidates to review yet. Run learning first."
+    }
+  },
+  "selector": {
+    "schedule": {
+      "options": {
+        "off": "Disabled",
+        "weekly": "Weekly"
+      }
+    },
+    "weekday": {
+      "options": {
+        "mon": "Monday",
+        "tue": "Tuesday",
+        "wed": "Wednesday",
+        "thu": "Thursday",
+        "fri": "Friday",
+        "sat": "Saturday",
+        "sun": "Sunday"
+      }
+    }
+  },
+  "issues": {
+    "no_energy_prefs": {
+      "title": "No gross power sources in Energy dashboard",
+      "description": "No grid, solar, battery, or home power source is configured in your Energy dashboard. Gross and remainder power will stay unavailable until a power source is configured in the Energy dashboard."
+    },
+    "missing_stat_rate": {
+      "title": "Missing power rate for {source}",
+      "description": "The Energy dashboard source {source} lacks a power sensor. Gross and remainder power will stay unavailable until a power sensor is configured for this source in the Energy dashboard."
+    },
+    "unsupported_power_config": {
+      "title": "Unsupported power configuration for {source}",
+      "description": "The Energy dashboard source {source} has an unsupported power configuration. Gross and remainder power will stay unavailable until the configuration is corrected in the Energy dashboard."
+    },
+    "source_not_found": {
+      "title": "Power source entity not found for {source}",
+      "description": "The power entity for {source} is not registered or present in Home Assistant. Gross and remainder power will stay unavailable until this source is available."
+    },
+    "invalid_unit": {
+      "title": "Invalid power unit for {source}",
+      "description": "The power entity for {source} does not report a valid power unit (e.g. W or kW). Gross and remainder power will stay unavailable until a valid power sensor is configured in the Energy dashboard."
+    },
+    "self_reference": {
+      "title": "Self-referencing entity {entity}",
+      "description": "PowerGuesser entity {entity} cannot be used as an input source or metered device in the Energy dashboard. Remove it from your Energy dashboard configuration."
+    },
+    "metered_no_power": {
+      "title": "No power sensor for {device}",
+      "description": "The metered device {device} is not subtracted from gross power until a power rate sensor is configured in the Energy dashboard, or the device has exactly one power sensor in W or kW."
+    },
+    "implausible_negative_gross": {
+      "title": "Implausible negative gross power",
+      "description": "Gross home power has been consistently negative. Likely causes include: an inverted grid power sensor (net export instead of net import), battery charge and discharge directions swapped, or solar measured on the DC side instead of AC consumption. Check your power sensor configuration in the Energy dashboard. This issue clears automatically after about 12 hours of plausible readings, or immediately when the Energy dashboard is edited."
+    },
+    "implausible_metered_above_gross": {
+      "title": "Metered power exceeds gross power",
+      "description": "The sum of metered consumer devices consistently exceeds gross household power. Likely causes include: metered devices counted twice in the device hierarchy, a smart plug power sensor reporting in the wrong unit, or an inverted battery/solar source sign. Check your device and power sensor configuration in the Energy dashboard. This issue clears automatically after about 12 hours of plausible readings, or immediately when the Energy dashboard is edited."
+    },
+    "buffer_reset": {
+      "title": "PowerGuesser started a new data buffer",
+      "description": "The existing buffer file could not be read (for example after a power cut or SD-card fault). It was kept as {backup} in the powerguesser folder of the configuration directory. Collected history starts again from now, and the notice disappears after the next restart."
+    },
+    "llm_auth": {
+      "title": "PowerGuesser cannot sign in to the LLM endpoint",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Update the LLM API key",
+            "description": "The endpoint at {host} rejected the API key, so learning stopped. Gross power, remainder and the history buffer keep working.\n\nSubmit to open the PowerGuesser options, then choose LLM endpoint and enter a valid key."
+          }
+        },
+        "abort": {
+          "open_options": "Opening the PowerGuesser options."
+        }
+      }
+    },
+    "learning_consent": {
+      "title": "Allow PowerGuesser to send power summaries to {endpoint}?",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Confirm data sharing for learning",
+            "description": "Learning sends summaries of your household power data to {endpoint} ({location}, {transport}) for the model {model}:\n- statistics per group of similar power steps (step size, duration, hour-of-day and weekday counts, energy share)\n- reference sessions of devices that already have their own power meter\n- in refinement rounds, how well each proposed device explained the training period\n\nNo raw readings, no timestamps, no entity ids. Device names: {names}.\n\nLearning runs may include a masked validation pass: the same kind of summaries with the devices that have their own power meter mixed back in and no reference sessions, used only to measure accuracy on this installation.\n\nThe first request is {bytes} bytes; a deliberately conservative estimate puts it at up to about {tokens} tokens (providers usually count fewer). The provider may keep requests according to its own terms.\n\nTo see the exact request first, run the action \"PowerGuesser: Preview learning payload\" under Developer tools > Actions.\n\nSubmit to allow learning with this endpoint. Changing the endpoint scheme, host or port, or the device-names setting, asks again."
+          }
+        },
+        "abort": {
+          "endpoint_changed": "The endpoint or the device-names setting changed. A new notice for the current settings has been created."
+        }
+      }
+    },
+    "learning_capped": {
+      "title": "PowerGuesser learning stopped at a limit",
+      "description": "Learning stopped before sending another request because the {cap} limit ({limit}) would have been exceeded. Raise the limit under the PowerGuesser options, Learning, or wait for the monthly reset. This notice clears after the next completed run or when a new month starts."
+    },
+    "detection_interval_too_slow": {
+      "title": "Sampling too slow for device detection",
+      "description": "Your power readings arrive about every {interval} s. Device detection needs a reading at least every {max_interval} s, so it is paused for {devices}: their power sensors are unavailable and their energy sensors keep their totals. If your meter integration lets you, shorten its update interval. This message disappears by itself once readings arrive often enough."
+    },
+    "device_record_missing": {
+      "title": "PowerGuesser device {name} has no saved data",
+      "description": "The device {name} exists but its learned parameters were not found (for example after restoring an older backup). Its sensors stay unavailable. Delete the device under Settings, PowerGuesser, then confirm the candidate again in Review."
+    },
+    "retired_device_in_energy": {
+      "title": "Merged device {name} is still in the Energy dashboard",
+      "description": "{name} was merged into {target} and no longer estimates energy. Its sensor {entity} keeps its last value. Replace it with the energy sensor of {target} in the Energy dashboard when you are ready; its past consumption stays in your history."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "gross_power": {
+        "name": "Gross power"
+      },
+      "remainder_power": {
+        "name": "Remainder power",
+        "state_attributes": {
+          "metered_w": {
+            "name": "Metered power"
+          },
+          "metered_unavailable": {
+            "name": "Unavailable metered devices"
+          },
+          "over_attribution": {
+            "name": "Over-attribution since last start (Wh)"
+          },
+          "clipped": {
+            "name": "Clipped"
+          }
+        }
+      },
+      "sample_interval": {
+        "name": "{source} sample interval",
+        "state_attributes": {
+          "mode": {
+            "name": "Mode"
+          },
+          "measured_from": {
+            "name": "Measured from"
+          },
+          "restored": {
+            "name": "Restored from last run"
+          },
+          "p90_s": {
+            "name": "90th percentile interval"
+          },
+          "delta_count": {
+            "name": "Measured intervals"
+          }
+        }
+      },
+      "effective_sample_interval": {
+        "name": "Effective sample interval",
+        "state_attributes": {
+          "enabled_event_types": {
+            "name": "Enabled event types"
+          },
+          "disabled_event_types": {
+            "name": "Disabled event types"
+          },
+          "interval_assumed": {
+            "name": "Interval assumed"
+          }
+        }
+      },
+      "bootstrapped_usable_history": {
+        "name": "Bootstrapped usable history",
+        "state_attributes": {
+          "bootstrap_status": {
+            "name": "Bootstrap status"
+          },
+          "computed_at": {
+            "name": "Report computed at"
+          },
+          "channels": {
+            "name": "Channels"
+          }
+        }
+      },
+      "device_power": {
+        "name": "Power"
+      },
+      "device_energy": {
+        "name": "Energy"
+      },
+      "device_validation": {
+        "name": "Validation error"
+      },
+      "learning_status": {
+        "name": "Learning status",
+        "state": {
+          "idle": "Idle",
+          "running": "Running",
+          "blocked": "Blocked",
+          "capped": "Cap reached",
+          "failed": "Failed"
+        },
+        "state_attributes": {
+          "last_run_start": {
+            "name": "Last run started"
+          },
+          "last_run_end": {
+            "name": "Last run ended"
+          },
+          "last_result": {
+            "name": "Last result"
+          },
+          "pending_candidates": {
+            "name": "Pending candidates"
+          },
+          "tokens_this_run": {
+            "name": "Tokens this run"
+          },
+          "tokens_this_month": {
+            "name": "Tokens this month"
+          },
+          "cost_this_month": {
+            "name": "Cost this month"
+          },
+          "running_job": {
+            "name": "Running job"
+          },
+          "rescore_failures": {
+            "name": "Failed re-scores"
+          },
+          "last_error": {
+            "name": "Last error"
+          },
+          "buffer_usable_days": {
+            "name": "Usable history (days)"
+          },
+          "blocked_reason": {
+            "name": "Blocked reason"
+          }
+        }
+      },
+      "detection_timing": {
+        "name": "Detection time per tick",
+        "state_attributes": {
+          "p50_ms": {
+            "name": "Median detection time"
+          },
+          "max_ms": {
+            "name": "Max detection time"
+          },
+          "ticks": {
+            "name": "Detector ticks"
+          },
+          "devices": {
+            "name": "Modelled devices"
+          },
+          "detector": {
+            "name": "Detector state"
+          },
+          "unattributed_total": {
+            "name": "Unattributed edges"
+          },
+          "unavailable_devices": {
+            "name": "Unavailable devices"
+          }
+        }
+      }
+    },
+    "button": {
+      "learn": {
+        "name": "Learn devices"
+      }
+    }
+  },
+  "config_subentries": {
+    "device": {
+      "entry_type": "Estimated device",
+      "initiate_flow": {
+        "user": "Add device",
+        "reconfigure": "Rename device"
+      },
+      "step": {
+        "user": {
+          "title": "Add device"
+        },
+        "reconfigure": {
+          "title": "Rename device",
+          "description": "The sensors keep their entity IDs and history.",
+          "data": {
+            "name": "Device name"
+          }
+        }
+      },
+      "abort": {
+        "use_review": "Devices are created by confirming a candidate under Configure, Review candidates.",
+        "reconfigure_successful": "The device was renamed."
+      },
+      "error": {
+        "name_invalid": "Enter a name of 1 to 64 characters without control characters."
+      }
+    }
+  },
+  "services": {
+    "learn": {
+      "name": "Learn devices",
+      "description": "Starts a learning run in the background. Needs an LLM endpoint, a confirmed data-sharing notice and at least 7 days of usable history."
+    },
+    "preview_learning_payload": {
+      "name": "Preview learning payload",
+      "description": "Returns the exact request body that the next learning run would send to the LLM endpoint, without sending anything. The API key and headers are never included."
+    },
+    "run_validation": {
+      "name": "Run validation",
+      "description": "Measures each plug-metered device's estimate against its own plug readings over the most recent holdout window and returns the report. Runs locally, sends nothing to the LLM.",
+      "fields": {
+        "synthetic_overlap": {
+          "name": "Add synthetic overlap",
+          "description": "Adds a clearly labelled synthetic overlap block by time-shifting one plug onto another. Real figures are not changed."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "not_loaded": {
+      "message": "PowerGuesser is not loaded."
+    },
+    "already_running": {
+      "message": "Another PowerGuesser job (learning, rescore, refit or validation) is already in progress."
+    },
+    "no_endpoint": {
+      "message": "Configure an LLM endpoint in the PowerGuesser options first."
+    },
+    "no_consent": {
+      "message": "Confirm the PowerGuesser data-sharing notice under Settings > System > Repairs first."
+    },
+    "insufficient_data": {
+      "message": "Learning needs at least 7 days of usable history; about {days_remaining} more days are needed."
+    },
+    "preview_unavailable": {
+      "message": "The preview cannot be built yet: {reason}."
+    },
+    "validation_failed": {
+      "message": "Validation failed: {error}"
+    }
+  }
+}
