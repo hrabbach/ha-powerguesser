@@ -44,7 +44,7 @@ Listing PowerGuesser in the default catalog follows once the 0.x line is stable.
 The learning phase sends the LLM **power-data summaries** (event and cluster features derived
 from your own buffer), never your raw history. Entity names are sent only if you opt in; the
 default is off. Before any request leaves your network you see a consent step that names the
-destination host, whether it is local or remote, the scheme, the model, the token and cost
+destination host, whether it is local or remote, the scheme, the model, the token and byte
 estimates, and whether entity names are included. A transport downgrade (for example HTTPS to
 HTTP) requires fresh consent.
 
@@ -87,3 +87,43 @@ Figures come from one household's holdout validation (plug-masked shadow models 
 
 PowerGuesser is licensed under the **Apache License, Version 2.0**. See [LICENSE](LICENSE) and
 [NOTICE](NOTICE).
+
+## Quick start
+
+1. Install PowerGuesser as described above and restart Home Assistant.
+2. Add the integration: **Settings → Devices & Services → Add Integration → PowerGuesser**.
+   Setup detects your gross power sources and metered devices from the Energy dashboard. The
+   sign self-check needs up to about 45 minutes of data before it can flag a problem.
+3. Open the integration's options and enter your LLM endpoint: base URL (ending in `/v1`), API
+   key if the endpoint needs one, and the model id. Saving runs a short capability test that
+   sends only a fixed test prompt — no household data.
+4. Confirm the data-sharing notice, then start a learning run with the `powerguesser.learn`
+   service. Learning needs at least 7 days of usable history; validated candidates appear after
+   about three weeks.
+5. Review candidates under **Review device candidates** and confirm the ones you recognise.
+   Confirming creates a device with power and energy sensors that PowerGuesser estimates
+   locally.
+
+## Usage examples
+
+Call the services from **Developer Tools → Actions** or from an automation:
+
+```yaml
+# Start a learning run in the background (needs an LLM endpoint, a confirmed
+# data-sharing notice and at least 7 days of usable history)
+action: powerguesser.learn
+```
+
+```yaml
+# See the exact request body the next learning run would send to the LLM
+# endpoint, without sending anything. The API key and headers are never included.
+action: powerguesser.preview_learning_payload
+response_variable: payload
+```
+
+```yaml
+# Measure each plug-metered device's estimate against its own plug readings
+# over the most recent holdout window. Runs locally, sends nothing to the LLM.
+action: powerguesser.run_validation
+response_variable: report
+```

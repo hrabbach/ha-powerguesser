@@ -27,6 +27,7 @@ from custom_components.powerguesser.const import (
     BUFFER_FILE,
     DOMAIN,
     SESSIONS_STORE_KEY,
+    SESSIONS_STORE_VERSION,
 )
 from custom_components.powerguesser.engine.intervals import ProfileSnapshot, gate
 from custom_components.powerguesser.review_store import resolve_session_target
@@ -1181,3 +1182,42 @@ async def test_candidate_session_produces_no_device_session_entry(
     # No device-target session: no sessions key and no confirmed device touched.
     assert "sessions" not in res
     assert res["confirmed_devices"] == []
+
+
+# ---------------------------------------------------------------------------
+# REV-04: entry removal must delete the plug-session Store
+# ---------------------------------------------------------------------------
+
+
+async def test_remove_entry_deletes_the_sessions_store(
+    recorder_mock: Any,
+    hass: HomeAssistant,
+    energy_manager: EnergyManager,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+    freezer: Any,
+) -> None:
+    """Removing the entry deletes powerguesser.review_sessions (REV-04).
+
+    Without this the records survive entry removal, so a remove/re-add restores
+    stale open sessions and a ghost session plug is re-tracked and (for a
+    candidate target) silently subtracted from the remainder.
+    """
+    from homeassistant.helpers.storage import Store
+
+    from custom_components.powerguesser import async_remove_entry
+
+    entry = await _setup_session_home(
+        hass, energy_manager, std_prefs, hass_storage, freezer
+    )
+    await _submit_start(hass, entry, PLUG, "candidate_sig01")
+    assert _stored_sessions(hass_storage), "the session was not stored"
+    assert SESSIONS_STORE_KEY in hass_storage
+
+    await async_remove_entry(hass, entry)
+
+    assert SESSIONS_STORE_KEY not in hass_storage
+    assert (
+        await Store(hass, SESSIONS_STORE_VERSION, SESSIONS_STORE_KEY).async_load()
+        is None
+    )

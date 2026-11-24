@@ -15,10 +15,10 @@ from custom_components.powerguesser.engine.validation.constants import OVERLAP_M
 STEP_S = 30.0
 
 
-def test_on_mask_nan_is_off() -> None:
+def test_plug_on_mask_nan_is_off() -> None:
     """A NaN (missing) plug reading counts as off, and the threshold is strict."""
     y = np.array([0.0, 5.0, PLUG_ON_W, PLUG_ON_W + 1.0, np.nan, 100.0])
-    assert list(overlap.on_mask(y)) == [False, False, False, True, False, True]
+    assert list(overlap.plug_on_mask(y)) == [False, False, False, True, False, True]
 
 
 def test_tick_masks_splits_solo_and_overlap() -> None:

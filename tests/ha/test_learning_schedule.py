@@ -254,7 +254,10 @@ async def test_schedule_rearms_on_time_change_and_removes_on_off(
     freezer.move_to(tue_415)
     async_fire_time_changed(hass, tue_415)
     await hass.async_block_till_done(wait_background_tasks=True)
-    assert aioclient_mock.call_count == 1
+    # Assert the trigger, not an exact HTTP total: a run may also make a masked
+    # shadow-pass call (Plan 05), so the count is 1 or 2 here.
+    after = aioclient_mock.call_count
+    assert after >= 1
     assert supervisor.coordinator.data["status"] == "idle"
 
     # Switch to off
@@ -272,7 +275,8 @@ async def test_schedule_rearms_on_time_change_and_removes_on_off(
     freezer.move_to(next_tue_415)
     async_fire_time_changed(hass, next_tue_415)
     await hass.async_block_till_done()
-    assert aioclient_mock.call_count == 1
+    # No new call
+    assert aioclient_mock.call_count == after
 
 
 async def test_schedule_skips_when_blocked_or_capped(

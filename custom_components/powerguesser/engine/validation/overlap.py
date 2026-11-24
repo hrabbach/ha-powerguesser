@@ -53,8 +53,12 @@ ENERGY_LEFT_DEFINITION = (
 )
 
 
-def on_mask(y: object, on_w: float = PLUG_ON_W) -> np.ndarray:
-    """Boolean ON mask of one plug series; a NaN (missing) reading counts as off."""
+def plug_on_mask(y: object, on_w: float = PLUG_ON_W) -> np.ndarray:
+    """Boolean ON mask of one plug series; a NaN (missing) reading counts as off.
+
+    Named distinctly from ``link.on_mask`` (spans -> samples): the two share no
+    semantics, so the distinct name keeps the seam explicit (audit 2026-11-24).
+    """
     arr = np.asarray(y, dtype=np.float64)
     return np.isfinite(arr) & (arr > float(on_w))
 

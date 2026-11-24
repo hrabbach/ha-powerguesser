@@ -84,6 +84,8 @@ from .const import (
     PREPARE_STARTUP_DELAY_S,
     REPAIR_OUTPUT_MAX_CHARS,
     REVIEW_STORE_KEY,
+    SESSIONS_STORE_KEY,
+    SESSIONS_STORE_VERSION,
     STAGE_TIMEOUT_S,
     USABLE_DAYS_REFRESH,
     VALIDATED_DAYS,
@@ -3422,3 +3424,8 @@ async def async_remove_learning_data(hass: HomeAssistant) -> None:
         REVIEW_STORE_KEY,
     ):
         await Store(hass, LEARNING_STORES_VERSION, key).async_remove()
+    # Plug sessions (Plan 06-06, D-09) live in their own Store. Without this the
+    # records survive entry removal, so a reinstall restores stale open sessions
+    # and a ghost session plug is re-tracked and silently subtracted from the
+    # remainder (REV-04).
+    await Store(hass, SESSIONS_STORE_VERSION, SESSIONS_STORE_KEY).async_remove()
