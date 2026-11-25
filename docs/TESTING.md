@@ -60,7 +60,7 @@ learning fixtures, LLM cassettes, and trace/program generators.
 
 ## Markers
 
-Two markers matter:
+Three markers matter:
 
 - **`slow`** — registered in `pyproject.toml`; used on tests that spawn the real
   learning-worker subprocess (seconds per test). Deselect them for a fast local
@@ -70,6 +70,11 @@ Two markers matter:
 - **`bootstrap_enabled`** — registered in `tests/conftest.py`; `bootstrap` is the
   only code path that schedules the recorder bootstrap, and tests opt in with
   this marker instead of paying its cost by default.
+- **`evidence_enabled`** — registered in `tests/conftest.py`; opt in to the
+  background evidence refresh (`LearningSupervisor._async_maybe_evidence`).
+  Without it the autouse `disable_evidence_refresh` fixture monkeypatches the
+  hook to a no-op, so tests that seed evidence-less candidates spawn no evidence
+  stage and stay isolated. Used in `tests/ha/test_evidence_refresh.py`.
 
 ## Running tests
 
@@ -146,5 +151,9 @@ download and commit so the four shards stay balanced.
 
 Two sibling validation jobs also gate merges: `hassfest` (HA integration lint)
 and `musl-gate` (verifies the manifest stays limited to `numpy`/`scipy` and that
-both resolve for aarch64 musl). The release pipeline additionally requires
-`export-dry-run` and `release-check` before tagging.
+both resolve for aarch64 musl). On a version tag these four validate jobs
+(`hassfest`, `musl-gate`, `pytest`, `export-dry-run`) are skipped — the MR
+pipeline already ran them on the same tree — so the tag pipeline is just
+`release-check` (plus the inline export scan `export-github` does before it
+publishes). `export-dry-run` runs on the tag only if it is pushed with
+`RELEASE_VALIDATE=1`, the direct-commit case.

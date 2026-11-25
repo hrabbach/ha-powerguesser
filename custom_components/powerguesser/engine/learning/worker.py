@@ -38,6 +38,7 @@ from .episodes import (
     plug_sessions,
     suppress_alignment_artefacts,
 )
+from .evidence import build_evidence
 from .identity import match_identities
 from .score import accept, block_score, gate_proposal, replay, scorecard
 from .series import load_residual
@@ -77,6 +78,10 @@ STAGES: tuple[str, ...] = (
     "validate",
     "validate_sessions",
     "shadow_link",
+    # Plan 07-03 (D-10): the pre-upgrade evidence refresh, driven by the
+    # supervisor's single-flight hook (Plan 07-04). main() uses STAGES as its
+    # argparse choices, so the entry here is what makes the CLI accept it.
+    "evidence",
 )
 
 # Plan 06-09 (REV-04): synthetic plug-line keys start at this base so they can
@@ -210,19 +215,19 @@ def build_episode_table(
     return table, all_rle, threshold
 
 
-def extract(job: Mapping) -> dict:
-    """Execute extract stage: load residual, detect episodes, cluster, and save digest."""
-    buffer_path = job["buffer_path"]
-    stage_dir = Path(job["stage_dir"])
-    stage_dir.mkdir(parents=True, exist_ok=True)
+def _load_job_residual(job: Mapping) -> tuple[Any, dict[int, dict]]:
+    """Build a stage's replayed residual and its session-window map from the job keys.
 
+    Shared by extract and the evidence stage (Plan 07-03): the evidence stage
+    must keep replaying exactly the residual extract scored, so both build it
+    here - the channel parsing, the session-window map and the single
+    load_residual call with session_windows - rather than duplicating the
+    construction. Returns (series, window_by_key); every other job key
+    (first_weekday, holdout keys, enabled_event_types) stays with the caller.
+    """
+    buffer_path = job["buffer_path"]
     grid_s = int(job.get("grid_s", 30))
     day_bounds_ms = job["day_bounds_ms"]
-    first_weekday = int(job.get("first_weekday", 0))
-    holdout_days = int(job.get("holdout_days", 0))
-    holdout_calendar_days = int(job.get("holdout_calendar_days", 0))
-    train_fraction = float(job.get("train_fraction", 0.7))
-    enabled_event_types = job.get("enabled_event_types", ["step", "cycle_shape", "continuous"])
     metered_channels = job.get("metered_channels", [])
     phase_channels = job.get("phase_channels", {})
     # Plan 06-09 (REV-04, D-25/D-12): the plug sessions overlapping this window.
@@ -255,7 +260,28 @@ def extract(job: Mapping) -> dict:
         phase_channels,
         session_windows=window_map,
     )
+    return series, window_by_key
+
+
+def extract(job: Mapping) -> dict:
+    """Execute extract stage: load residual, detect episodes, cluster, and save digest."""
+    stage_dir = Path(job["stage_dir"])
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    grid_s = int(job.get("grid_s", 30))
+    day_bounds_ms = job["day_bounds_ms"]
+    first_weekday = int(job.get("first_weekday", 0))
+    holdout_days = int(job.get("holdout_days", 0))
+    holdout_calendar_days = int(job.get("holdout_calendar_days", 0))
+    train_fraction = float(job.get("train_fraction", 0.7))
+    enabled_event_types = job.get("enabled_event_types", ["step", "cycle_shape", "continuous"])
+    metered_channels = job.get("metered_channels", [])
+    phase_channels = job.get("phase_channels", {})
+
+    series, window_by_key = _load_job_residual(job)
     r = series.residual
+    start_ms = day_bounds_ms[0]
+    step_ms = grid_s * 1000
     step_s = float(grid_s)
 
     # Day sufficiency and train/val/holdout split
@@ -753,6 +779,59 @@ def compile_score(job: Mapping) -> dict:
             except (KeyError, TypeError, ValueError):
                 continue
 
+    # Plan 07-01 (D-09, D-11): attach per-candidate evidence computed from
+    # this run's own replay claims. Explicit opt-in: only a job that sets
+    # "with_evidence" to exactly True gets evidence, so the Plan 04-13 golden
+    # compile job (no such key) stays byte-identical and the shadow pass
+    # (False) keeps its artefacts lean. Evidence is read-only over claims: it
+    # never feeds accept(), block_score or the scorecard (written above).
+    if job.get("with_evidence") is True and (stage_dir / "residual.npz").is_file():
+        with np.load(str(stage_dir / "residual.npz"), allow_pickle=False) as residual_data:
+            ev_start_ms = int(residual_data["start_ms"][0])
+            ev_step_ms = int(residual_data["step_ms"][0])
+            ev_bounds_ms = np.asarray(residual_data["day_bounds_ms"], dtype=np.int64)
+        # Evidence window contract (Plans 07-01/03/04): the union of the replay
+        # claims of blocks 0, 1 and 2 (train + val + holdout) over the valid
+        # days, with observed_days = the valid-day count. The block-2 replay is
+        # evidence-only: with production holdout 0 it is empty and returns at
+        # its no-episode exit; it never feeds accept(), block_score, val.json or
+        # the scorecard.
+        hold_res = replay(
+            updated_artefacts,
+            episodes,
+            block=2,
+            residual_wh=float(block_residual.get("holdout", 0.0)),
+        )
+        meta_days = meta.get("days", {})
+        valid_days = (
+            [int(d) for d in (meta_days.get("train") or [])]
+            + [int(d) for d in (meta_days.get("val") or [])]
+            + [int(d) for d in (meta_days.get("holdout") or [])]
+        )
+        claim_sets = {
+            art.signature_id: (
+                set(train_res.claims.get(art.signature_id, ()))
+                | set(val_res.claims.get(art.signature_id, ()))
+                | set(hold_res.claims.get(art.signature_id, ()))
+            )
+            for art in updated_artefacts
+        }
+        evidence = build_evidence(
+            episodes,
+            claim_sets,
+            start_ms=ev_start_ms,
+            step_ms=ev_step_ms,
+            day_bounds_ms=ev_bounds_ms,
+            valid_days=valid_days,
+            now_iso=job.get("now_iso"),
+            source="run",
+        )
+        # Zip by index: match_identities returns to_dict() copies in the order
+        # of updated_artefacts and may rewrite a signature id, so the original
+        # artefact id is the evidence key.
+        for original_art, matched in zip(updated_artefacts, matched_dicts):
+            matched["evidence"] = evidence[original_art.signature_id]
+
     # Rank by train claimed share descending, ties by signature_id ascending
     matched_dicts.sort(
         key=lambda d: (-d.get("scores", {}).get("train", {}).get("share", 0.0), d["signature_id"])
@@ -912,6 +991,36 @@ def rescore(job: Mapping) -> dict:
             ),
         }
 
+    # Plan 07-03 (D-11): per-signature evidence, behind the same explicit
+    # opt-in as compile_score. A rescore job without the key (the Plan 04-13
+    # golden job) returns per_signature, rescore.json and stage_outputs("rescore")
+    # exactly as in 0.2.1, with no "evidence" key.
+    #
+    # Rescore replays only its own post-window days, so this evidence covers
+    # fewer observed days than the evidence stage's full-window refresh. It is
+    # coherent only together with the supervisor's never-narrow merge rule in
+    # learning._async_run_rescore (Plan 07-04 Task 2: stored evidence covering
+    # more observed days is kept) and the evidence stage's full-window refresh
+    # of every source "rescore" entry (Plan 07-04 Task 1 predicate); changing
+    # either side needs the other reviewed.
+    if job.get("with_evidence") is True:
+        evidence_map = build_evidence(
+            table,
+            {
+                art.signature_id: set(val_res.claims.get(art.signature_id, ()))
+                for art in artefacts
+            },
+            start_ms=start_ms,
+            step_ms=step_ms,
+            day_bounds_ms=day_bounds_ms,
+            valid_days=valid_days,
+            now_iso=job.get("now_iso"),
+            source="rescore",
+        )
+        for sig_id, stats in per_signature.items():
+            if sig_id in evidence_map:
+                stats["evidence"] = evidence_map[sig_id]
+
     rescore_dict = {
         "S": round(float(val_S), 5),
         "conflict_share": round(float(val_conf), 5),
@@ -922,6 +1031,182 @@ def rescore(job: Mapping) -> dict:
     rescore_path = stage_dir / "rescore.json"
     _write_atomic(rescore_path, canonical_json(rescore_dict))
     return rescore_dict
+
+
+def evidence(job: Mapping) -> dict:
+    """Execute evidence stage: replay the sent artefacts over the whole job window.
+
+    Candidate and device artefacts are treated alike (D-07a): every entry of
+    ``job["candidates"]`` goes through ``SignatureArtefact.from_dict`` and the
+    output is keyed by the entry's ``signature_id``, so the supervisor can send
+    a confirmed or unconfirmed device's active version artefact re-keyed as
+    ``device:<uuid>`` and a version artefact carries no decoration keys that
+    ``from_dict`` would object to. There is no artefact-only device variant.
+
+    The residual is rebuilt ONLY through ``_load_job_residual``, the same
+    helper extract uses, so the evidence rows equal the rows the learner
+    scored by construction. The evidence window contract (Plans 07-01/03/04):
+    every episode starting on a valid day is block 1 (holdout days included)
+    and the stage never splits days or reads the holdout keys; observed days
+    are ``data_days`` of the replayed residual. It writes
+    ``stage_dir/evidence.json`` with one entry per sent candidate id, including
+    the n_runs-0 ones, so the supervisor's evidence-needed predicate clears.
+    """
+    stage_dir = Path(job["stage_dir"])
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    day_bounds_ms = job["day_bounds_ms"]
+    grid_s = int(job.get("grid_s", 30))
+    first_weekday = int(job.get("first_weekday", 0))
+    enabled_event_types = job.get("enabled_event_types", ["step", "cycle_shape", "continuous"])
+    candidates_raw = job.get("candidates", [])
+
+    # Fewer than 2 day bounds (mirroring rescore's guard): load no residual and
+    # still write an n_runs-0 entry for every sent candidate, so the
+    # evidence-needed predicate clears and the hook cannot loop on an empty
+    # window (Plan 07-04 Pitfall 4).
+    if len(day_bounds_ms) < 2:
+        sent_ids = [
+            str(entry["signature_id"])
+            for entry in candidates_raw
+            if isinstance(entry, Mapping) and entry.get("signature_id") is not None
+        ]
+        evidence_map = build_evidence(
+            {},
+            {sig_id: set() for sig_id in sent_ids},
+            start_ms=int(day_bounds_ms[0]) if day_bounds_ms else 0,
+            step_ms=grid_s * 1000,
+            day_bounds_ms=day_bounds_ms,
+            valid_days=[],
+            now_iso=job.get("now_iso"),
+            source="refresh",
+        )
+        evidence_path = stage_dir / "evidence.json"
+        _write_atomic(evidence_path, canonical_json(evidence_map))
+        return {
+            "stage_dir": str(stage_dir),
+            "result": str(evidence_path),
+            "n": len(evidence_map),
+        }
+
+    series, _window_by_key = _load_job_residual(job)
+    r = series.residual
+    start_ms = day_bounds_ms[0]
+    step_ms = grid_s * 1000
+
+    valid_days = data_days(r, start_ms, step_ms, day_bounds_ms)
+
+    # Episode table through the shared helper (block assignment below stays
+    # here). The transient session-only clustering columns are not used here;
+    # pop them like rescore, then add the CSR rle columns replay needs for
+    # program artefacts.
+    table, all_rle, _threshold_w = build_episode_table(
+        r,
+        series.phases,
+        start_ms,
+        step_ms,
+        day_bounds_ms,
+        first_weekday,
+        enabled_event_types,
+    )
+    table.pop("peak_w", None)
+    table.pop("n_segments", None)
+
+    start_ts_arr = start_ms + table["start_i"] * step_ms
+    day_indices = (
+        np.searchsorted(np.array(day_bounds_ms, dtype=np.int64), start_ts_arr, side="right") - 1
+    )
+    valid_set = set(valid_days)
+    # Evidence window contract: every episode inside a valid day is block 1
+    # (holdout days included; the stage never reads holdout_days,
+    # holdout_calendar_days or train_fraction and never splits days).
+    table["block"] = np.where(np.isin(day_indices, list(valid_set)), 1, -1).astype(np.int32)
+
+    rle_offsets: list[int] = [0]
+    rle_levels: list[int] = []
+    rle_counts: list[int] = []
+    for rle_item in all_rle:
+        for lvl, cnt in rle_item:
+            rle_levels.append(int(lvl))
+            rle_counts.append(int(cnt))
+        rle_offsets.append(len(rle_levels))
+
+    table["rle_offset"] = np.array(rle_offsets, dtype=np.int64)
+    table["rle_level_w"] = np.array(rle_levels, dtype=np.int32)
+    table["rle_n"] = np.array(rle_counts, dtype=np.int32)
+
+    # WR-02: isolate each sent artefact. One unusable stored candidate or device
+    # record (a partial restore, a hand-edit, an artefact written by another
+    # version) must not raise and fail the whole stage for every candidate and
+    # device. A skipped entry keeps its signature_id and is given an empty claim
+    # set below, so it still receives the documented n_runs-0 evidence entry and
+    # the supervisor's evidence-needed predicate cannot loop on it.
+    artefacts: list[SignatureArtefact] = []
+    skipped_ids: list[str] = []
+    for entry in candidates_raw:
+        if not isinstance(entry, Mapping):
+            # WR-01: a non-mapping entry (a list, str or int) has no
+            # signature_id to key on and can never be replayed, so it is
+            # dropped from the batch like any other unusable artefact.
+            err: Exception = TypeError(
+                f"candidate entry is {type(entry).__name__}, not a mapping"
+            )
+            sig_id = None
+        else:
+            try:
+                artefacts.append(SignatureArtefact.from_dict(entry))
+                continue
+            except Exception as exc:  # noqa: BLE001 - one bad artefact must not fail the batch
+                err = exc
+                sig_id = (
+                    str(entry.get("signature_id"))
+                    if entry.get("signature_id") is not None
+                    else None
+                )
+        if sig_id is not None and sig_id not in skipped_ids:
+            skipped_ids.append(sig_id)
+        # IN-01: the supervisor surfaces this progress event in the HA log (see
+        # learning._read_stdout), so a skipped artefact stays visible without
+        # failing the whole batch.
+        print(
+            json.dumps(
+                {
+                    "event": "progress",
+                    "stage": "evidence",
+                    "step": "skipped",
+                    "id": sig_id,
+                    "error": f"{type(err).__name__}: {err}",
+                }
+            ),
+            flush=True,
+        )
+
+    residual_wh = residual_energy_wh(r, start_ms, step_ms, day_bounds_ms, valid_days)
+    val_res = replay(artefacts, table, block=1, residual_wh=residual_wh)
+
+    claims = {
+        art.signature_id: set(val_res.claims.get(art.signature_id, ()))
+        for art in artefacts
+    }
+    for sig_id in skipped_ids:
+        claims.setdefault(sig_id, set())
+    evidence_map = build_evidence(
+        table,
+        claims,
+        start_ms=start_ms,
+        step_ms=step_ms,
+        day_bounds_ms=day_bounds_ms,
+        valid_days=valid_days,
+        now_iso=job.get("now_iso"),
+        source="refresh",
+    )
+    evidence_path = stage_dir / "evidence.json"
+    _write_atomic(evidence_path, canonical_json(evidence_map))
+    return {
+        "stage_dir": str(stage_dir),
+        "result": str(evidence_path),
+        "n": len(evidence_map),
+    }
 
 
 def refit(job: Mapping) -> dict:
@@ -2087,6 +2372,8 @@ def run_stage(stage: str, job: Mapping) -> dict:
         return validate_sessions(job)
     if stage == "shadow_link":
         return shadow_link(job)
+    if stage == "evidence":
+        return evidence(job)
     raise ValueError(f"Unknown stage: {stage}")
 
 
@@ -2140,6 +2427,10 @@ def stage_outputs(stage: str, result: Mapping) -> dict:
                         if v.get("validation_error_pct") is None
                         else float(v["validation_error_pct"])
                     ),
+                    # Plan 07-03 (D-11): copied as is only when the entry has
+                    # it, so a rescore without with_evidence keeps stage_outputs
+                    # unchanged (no "evidence": None placeholder).
+                    **({"evidence": v["evidence"]} if "evidence" in v else {}),
                 }
                 for sig, v in dict(result["per_signature"]).items()
             },
@@ -2171,6 +2462,11 @@ def stage_outputs(stage: str, result: Mapping) -> dict:
             "result": str(result["result"]),
             "n_links": int(result["n_links"]),
             "n_not_discovered": int(result["n_not_discovered"]),
+        }
+    if stage == "evidence":
+        return {
+            "result": str(result["result"]),
+            "n": int(result["n"]),
         }
     raise ValueError(f"Unknown stage: {stage}")
 

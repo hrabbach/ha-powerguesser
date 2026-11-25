@@ -135,6 +135,29 @@ MIN_LEARNING_DAYS = 7.0
 VALIDATED_DAYS = 21.0
 USABLE_DAYS_REFRESH = timedelta(hours=6)
 
+# Evidence refresh failure cap (D-12/D-12a): shared by the refresh stage
+# (Plan 07-04) and the Review text (Plan 07-05). Persisted beside
+# rescore_failures in the learning Store; at the cap the check stops starting
+# the stage until a learning run (or a successful stage) resets it.
+EVIDENCE_MAX_FAILURES = 3
+
+# D-11a: the age refresh threshold. The existing 6-hourly refresh recomputes
+# candidate and device evidence older than this (no new timer).
+EVIDENCE_REFRESH_AGE = timedelta(days=7)
+
+# D-13: candidate-only decorations that must never enter a stored device
+# artefact (versions, pending proposals, alias artefacts). "origin" is reserved
+# for EVID-05 capture provenance (nothing sets it in this phase); "evidence" is
+# the candidate evidence dict, which is display-only and lives outside every
+# device record. One tuple keeps all three D-13 copy sites in lockstep.
+CANDIDATE_DECORATION_KEYS: tuple[str, ...] = (
+    "identity",
+    "fingerprint",
+    "first_label",
+    "evidence",
+    "origin",
+)
+
 PREPARE_STARTUP_DELAY_S = 300
 PREPARE_DEBOUNCE_S = 30
 

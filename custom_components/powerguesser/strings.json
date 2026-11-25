@@ -69,7 +69,7 @@
       },
       "candidate": {
         "title": "Candidate",
-        "description": "{candidate}",
+        "description": "{candidate}\n\n{evidence}",
         "menu_options": {
           "confirm": "Confirm as device",
           "rename": "Name it",
@@ -79,7 +79,7 @@
       },
       "device": {
         "title": "Confirmed device",
-        "description": "{candidate}",
+        "description": "{candidate}\n\n{evidence}",
         "menu_options": {
           "accept_update": "Accept the proposed update",
           "rollback": "Restore an earlier parameter version",
@@ -400,6 +400,15 @@
           "last_run_end": {
             "name": "Last run ended"
           },
+          "last_attempt_start": {
+            "name": "Last attempt started"
+          },
+          "last_attempt_end": {
+            "name": "Last attempt ended"
+          },
+          "last_attempt_outcome": {
+            "name": "Last attempt outcome"
+          },
           "last_result": {
             "name": "Last result"
           },
@@ -420,6 +429,9 @@
           },
           "rescore_failures": {
             "name": "Failed re-scores"
+          },
+          "evidence_failures": {
+            "name": "Failed evidence refreshes"
           },
           "last_error": {
             "name": "Last error"

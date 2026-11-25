@@ -153,6 +153,10 @@ async def test_run_cap_stops_before_sending(
     data = supervisor.coordinator.data
     assert data["status"] == "capped"
     assert data["last_error"] == "cap_reached: run_input"
+    # A capped run records its attempt as capped (CLEAN-02, D-15)
+    assert data["last_attempt"]["outcome"] == "capped"
+    assert data["last_attempt"]["started"] is not None
+    assert data["last_attempt"]["ended"] is not None
 
     issue_reg = ir.async_get(hass)
     issue = issue_reg.async_get_issue(DOMAIN, ISSUE_LEARNING_CAPPED)
@@ -814,6 +818,9 @@ async def test_cancelled_run_persists_month_counters(
     await hass.async_block_till_done()
 
     assert hass_storage[LEARNING_STORE_KEY]["data"]["month"]["input"] == counted
+    # A cancelled (user-stopped) run is recorded as stopped (CLEAN-02, D-15)
+    assert hass_storage[LEARNING_STORE_KEY]["data"]["last_attempt"]["outcome"] == "stopped"
+    assert hass_storage[LEARNING_STORE_KEY]["data"]["last_attempt"]["ended"] is not None
 
 
 async def test_usage_without_prompt_tokens_does_not_calibrate(

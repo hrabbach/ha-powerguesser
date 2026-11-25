@@ -27,6 +27,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "bootstrap_enabled: run the recorder bootstrap in this test",
     )
+    config.addinivalue_line(
+        "markers",
+        "evidence_enabled: run the background evidence refresh in this test",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +42,29 @@ def disable_bootstrap_schedule(
         monkeypatch.setattr(
             "custom_components.powerguesser.hub.PowerGuesserHub.async_schedule_bootstrap",
             lambda self: None,
+        )
+
+
+@pytest.fixture(autouse=True)
+def disable_evidence_refresh(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No-op the evidence refresh hook unless marked with evidence_enabled.
+
+    The hook runs at the end of async_start and in every job slot-release
+    finally, so an un-isolated net would spawn evidence stages (and subprocesses)
+    in tests that seed evidence-less candidates for other reasons. The
+    monkeypatch keeps raising=True, so a rename of the hook fails loudly instead
+    of silently re-enabling it.
+    """
+    if request.node.get_closest_marker("evidence_enabled") is None:
+
+        async def _noop_maybe_evidence(self: Any, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "custom_components.powerguesser.learning.LearningSupervisor._async_maybe_evidence",
+            _noop_maybe_evidence,
         )
 
 

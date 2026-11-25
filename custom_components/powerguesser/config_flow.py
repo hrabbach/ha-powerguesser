@@ -67,6 +67,7 @@ from .engine.phases import PhaseSumResult, check_phase_sum
 from .engine.prefs import ABORT_ORDER, build_source_model
 from .hub import parse_watts
 from .learning import CandidateGone
+from . import review_actions
 from .review_store import (
     SESSION_END_USER,
     normalise_name,
@@ -1193,7 +1194,6 @@ class PowerGuesserOptionsFlow(OptionsFlow):
             self._review_errors = {"base": "candidate_gone"}
             return await self.async_step_review()
 
-        rec = hub.devices.record(self._device_uuid)
         menu_opts: list[str] = []
         if entry["update_available"]:
             menu_opts.append("accept_update")
@@ -1202,11 +1202,17 @@ class PowerGuesserOptionsFlow(OptionsFlow):
         if self._device_merge_sources(hub, self._device_uuid):
             menu_opts.append("merge")
         menu_opts.append("rename")
+        evidence, state = review_actions.evidence_view(
+            hub, dev_uuid=self._device_uuid
+        )
         return self.async_show_menu(
             step_id="device",
             menu_options=menu_opts,
             description_placeholders={
-                "candidate": _escape_markdown(hub.learning.candidate_label(entry))
+                "candidate": _escape_markdown(hub.learning.candidate_label(entry)),
+                # D-07a: the same block as a candidate, replayed from the
+                # device's active artefact (or the "n/a" block without one).
+                "evidence": review_actions.evidence_text(evidence, state),
             },
         )
 
@@ -1319,10 +1325,17 @@ class PowerGuesserOptionsFlow(OptionsFlow):
         if len(visible) > 1:
             menu_opts.append("merge")
         menu_opts.append("dismiss")
+        evidence, state = review_actions.evidence_view(hub, cand=cand)
         return self.async_show_menu(
             step_id="candidate",
             menu_options=menu_opts,
-            description_placeholders={"candidate": _escape_markdown(label)},
+            description_placeholders={
+                "candidate": _escape_markdown(label),
+                # Plan 07-05 (D-06/D-07a/D-12): the full evidence block below the
+                # unchanged candidate label; a row that comes from an unconfirmed
+                # device record is read as a device, never as a pending candidate.
+                "evidence": review_actions.evidence_text(evidence, state),
+            },
         )
 
     async def async_step_confirm(
@@ -1353,16 +1366,13 @@ class PowerGuesserOptionsFlow(OptionsFlow):
         if user_input is not None:
             raw_name = str(user_input.get("name", ""))
             try:
-                norm_name = normalise_name(raw_name)
-            except ValueError:
+                await review_actions.async_confirm_candidate(hub, cand_id, raw_name)
+            except review_actions.InvalidName:
                 errors["base"] = "name_invalid"
+            except CandidateGone:
+                self._review_errors = {"base": "candidate_gone"}
+                return await self.async_step_review()
             else:
-                await hub.devices.async_confirm(
-                    cand,
-                    norm_name,
-                    preview=preview,
-                    trained_at=hub.learning.candidates_created_at,
-                )
                 return await self.async_step_review()
 
         dec = hub.learning.review.decisions.get(cand_id)
@@ -1417,18 +1427,14 @@ class PowerGuesserOptionsFlow(OptionsFlow):
         if user_input is not None:
             raw_name = str(user_input.get("name", ""))
             try:
-                norm_name = normalise_name(raw_name)
-            except ValueError:
+                await review_actions.async_rename_candidate(hub, cand_id, raw_name)
+            except review_actions.InvalidName:
                 errors["base"] = "name_invalid"
+            except CandidateGone:
+                self._review_errors = {"base": "candidate_gone"}
+                return await self.async_step_review()
             else:
-                try:
-                    await hub.learning.async_record_decision(
-                        "rename", cand_id, name=norm_name
-                    )
-                    return await self.async_step_review()
-                except CandidateGone:
-                    self._review_errors = {"base": "candidate_gone"}
-                    return await self.async_step_review()
+                return await self.async_step_review()
 
         dec = hub.learning.review.decisions.get(cand_id)
         current_name = (dec.get("name") if dec else None) or cand.get("label") or ""
@@ -1474,35 +1480,20 @@ class PowerGuesserOptionsFlow(OptionsFlow):
         if entry is None:
             self._review_errors = {"base": "candidate_gone"}
             return await self.async_step_review()
-        rec = hub.devices.record(dev_uuid)
 
         errors: dict[str, str] = {}
         if user_input is not None:
             raw_name = str(user_input.get("name", ""))
             try:
-                norm_name = normalise_name(raw_name)
-            except ValueError:
+                await review_actions.async_rename_device(
+                    self.hass, self.config_entry, hub, dev_uuid, raw_name
+                )
+            except review_actions.InvalidName:
                 errors["base"] = "name_invalid"
+            except CandidateGone:
+                self._review_errors = {"base": "candidate_gone"}
+                return await self.async_step_review()
             else:
-                sub = next(
-                    (
-                        s
-                        for s in self.config_entry.get_subentries_of_type(
-                            SUBENTRY_TYPE_DEVICE
-                        )
-                        if s.subentry_id == rec.get("subentry_id")
-                    ),
-                    None,
-                )
-                if sub is None:
-                    self._review_errors = {"base": "candidate_gone"}
-                    return await self.async_step_review()
-                self.hass.config_entries.async_update_subentry(
-                    self.config_entry,
-                    sub,
-                    title=norm_name,
-                    data={**sub.data, "name": norm_name},
-                )
                 return await self.async_step_review()
 
         schema = vol.Schema(
@@ -1555,18 +1546,14 @@ class PowerGuesserOptionsFlow(OptionsFlow):
 
         errors: dict[str, str] = {}
         if user_input is not None:
-            sources = user_input.get("sources")
-            if isinstance(sources, str):
-                sources = [sources]
-            elif not isinstance(sources, list):
-                sources = list(sources or [])
             try:
-                await hub.learning.async_record_decision(
-                    "merge", cand_id, sources=sources
+                await review_actions.async_merge_candidate(
+                    hub, cand_id, user_input.get("sources")
                 )
-                return await self.async_step_review()
             except CandidateGone:
                 self._review_errors = {"base": "candidate_gone"}
+                return await self.async_step_review()
+            else:
                 return await self.async_step_review()
 
         options = [
@@ -1619,48 +1606,17 @@ class PowerGuesserOptionsFlow(OptionsFlow):
 
         errors: dict[str, str] = {}
         if user_input is not None:
-            raw = user_input.get("sources")
-            if isinstance(raw, str):
-                raw = [raw]
-            elif not isinstance(raw, list):
-                raw = list(raw or [])
-            source_sigs: list[str] = []
-            invalid = False
-            for value in raw:
-                value = str(value)
-                if value.startswith("device_"):
-                    src_uuid = value[len("device_") :]
-                    src_rec = hub.devices.record(src_uuid) if src_uuid else None
-                    if src_rec is None or not src_rec.get("signature_id"):
-                        invalid = True
-                        break
-                    source_sigs.append(str(src_rec["signature_id"]))
-                else:
-                    # An unconfirmed source: a visible switched candidate only
-                    # (D-13); signature ids never start with "device_".
-                    cand = next(
-                        (
-                            c
-                            for c in hub.learning.visible_candidates()
-                            if c.get("signature_id") == value
-                        ),
-                        None,
-                    )
-                    if cand is None or cand.get("kind") != "switched":
-                        invalid = True
-                        break
-                    source_sigs.append(value)
-            if invalid:
+            try:
+                await review_actions.async_merge_device(
+                    hub, self._device_uuid, user_input.get("sources")
+                )
+            except review_actions.InvalidSource:
                 errors["base"] = "candidate_gone"
+            except (CandidateGone, ValueError):
+                self._review_errors = {"base": "candidate_gone"}
+                return await self.async_step_review()
             else:
-                try:
-                    await hub.learning.async_record_decision(
-                        "merge", target_sig, sources=source_sigs
-                    )
-                    return await self.async_step_review()
-                except (CandidateGone, ValueError):
-                    self._review_errors = {"base": "candidate_gone"}
-                    return await self.async_step_review()
+                return await self.async_step_review()
 
         options = [
             selector.SelectOptionDict(
@@ -1704,7 +1660,7 @@ class PowerGuesserOptionsFlow(OptionsFlow):
         cand_id = self._candidate_id
         if cand_id:
             try:
-                await hub.learning.async_record_decision("dismiss", cand_id)
+                await review_actions.async_dismiss_candidate(hub, cand_id)
             except CandidateGone:
                 self._review_errors = {"base": "candidate_gone"}
                 return await self.async_step_review()

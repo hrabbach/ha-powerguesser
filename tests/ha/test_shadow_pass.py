@@ -277,6 +277,36 @@ async def test_learning_run_stores_shadow_set_and_validation_uses_it(
     assert isinstance(kettle["energy_error_pct"], (int, float))
 
 
+async def test_shadow_set_artefacts_carry_no_evidence(
+    hass: HomeAssistant,
+    energy_manager: object,
+    kettle_plug_prefs: dict[str, Any],
+    inprocess_worker: object,
+    aioclient_mock: object,
+) -> None:
+    """The shadow pass stores no evidence: its compile job writes with_evidence false.
+
+    Evidence would otherwise be attached to the shadow artefacts from the
+    shadow stage dir's own residual.npz; the shadow caller's False keeps the
+    hidden shadow set lean (Plan 07-01).
+    """
+    entry = await _setup_kettle_entry(hass, energy_manager, kettle_plug_prefs)
+    _default_responder(aioclient_mock)
+
+    supervisor = await _run_learn(entry)
+    last_run = supervisor.coordinator.data["last_run"]
+
+    stored = entry.runtime_data.validation.shadow_set
+    assert stored is not None
+    assert stored["artefacts"], "the shadow responder proposes the kettle"
+    for artefact in stored["artefacts"]:
+        assert "evidence" not in artefact
+
+    shadow_dir = _run_stage_dir(hass, str(last_run["run_id"])) / "shadow"
+    job = json.loads((shadow_dir / "job_compile_1.json").read_text(encoding="utf-8"))
+    assert job["with_evidence"] is False
+
+
 # ---------------------------------------------------------------------------
 # Task 2: cadence, caps, failures, isolation and the after-learning chain
 # ---------------------------------------------------------------------------

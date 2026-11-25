@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Mapping, Sequence
 import contextlib
+import copy
 import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
@@ -38,6 +39,7 @@ from .const import (
     BUFFER_DIR,
     BUFFER_FILE,
     CANDIDATES_STORE_KEY,
+    CANDIDATE_DECORATION_KEYS,
     CONF_LLM_API_KEY,
     CONF_LLM_BASE_URL,
     CONF_LLM_MODEL,
@@ -70,6 +72,8 @@ from .const import (
     DEFAULT_SCHEDULE_WEEKDAY,
     DEFAULT_VALIDATE_AFTER_LEARNING,
     DOMAIN,
+    EVIDENCE_MAX_FAILURES,
+    EVIDENCE_REFRESH_AGE,
     ISSUE_LEARNING_CAPPED,
     ISSUE_LEARNING_CONSENT,
     ISSUE_LLM_AUTH,
@@ -109,6 +113,7 @@ from .engine.learning.budget import (
     truncation_suspected,
     update_ratio,
 )
+from .engine.learning.evidence import EVIDENCE_VERSION
 from .engine.learning.prompts import payload_bytes
 from .engine.learning.worker import SESSION_KEY_BASE, peak_memory_text
 from .engine.llm_wire import extract_json, model_matches
@@ -170,6 +175,7 @@ _REQUIRED_STAGE_OUTPUTS: dict[str, tuple[str, ...]] = {
     "compile_score": ("S", "conflict_share", "accepted"),
     "rescore": ("S", "conflict_share", "per_signature"),
     "refit": ("result", "accepted", "current_S", "new_S"),
+    "evidence": ("result",),
 }
 
 
@@ -189,6 +195,21 @@ def _parse_iso_ms(value: Any) -> int | None:
     if parsed is None:
         return None
     return int(round(parsed.timestamp() * 1000))
+
+
+def _evidence_is_aged(evidence: Mapping[str, Any]) -> bool:
+    """True when an evidence dict's computed_at is missing, unparsable or stale.
+
+    D-11a: only the 6-hourly refresh checks age; a missing or unparsable
+    computed_at counts as aged so the stage recomputes it.
+    """
+    computed = evidence.get("computed_at")
+    if not isinstance(computed, str):
+        return True
+    parsed = dt_util.parse_datetime(computed)
+    if parsed is None:
+        return True
+    return parsed < dt_util.utcnow() - EVIDENCE_REFRESH_AGE
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,9 +263,11 @@ class LearningSupervisor:
             "status": "idle",
             "running_job": None,
             "rescore_failures": 0,
+            "evidence_failures": 0,
             "blocked_reason": None,
             "last_run": None,
             "last_error": None,
+            "last_attempt": None,
             "pending_candidates": 0,
             "tokens_run": {"input": 0, "output": 0},
             "model_mismatch_run": None,
@@ -264,6 +287,11 @@ class LearningSupervisor:
         self.candidates: list[dict[str, Any]] = []
         self._candidates_record: dict[str, Any] | None = None
         self._rescore_failures: int = 0
+        self._evidence_failures: int = 0
+        # D-07a/D-13: device evidence lives here, keyed by device uuid, never in
+        # a device record (whose schema is pinned and whose versions D-13 keeps
+        # evidence-free).
+        self._device_evidence: dict[str, dict[str, Any]] = {}
         self._calibration: dict[str, dict[str, Any]] = {}
         self.run_task: asyncio.Task[Any] | None = None
         # Set synchronously while a run or rescore start is between its slot check and
@@ -291,6 +319,7 @@ class LearningSupervisor:
             "blocked_reason": data.get("blocked_reason"),
             "last_run": data.get("last_run"),
             "last_error": data.get("last_error"),
+            "last_attempt": data.get("last_attempt"),
             "tokens_run": data.get("tokens_run", {"input": 0, "output": 0}),
             "model_mismatch_run": data.get("model_mismatch_run"),
             "trimmed_run": data.get("trimmed_run", 0),
@@ -300,8 +329,20 @@ class LearningSupervisor:
             ),
             "usable_days": data.get("usable_days", {"value": 0.0, "computed_at": None}),
             "rescore_failures": getattr(self, "_rescore_failures", 0),
+            "evidence_failures": getattr(self, "_evidence_failures", 0),
+            "device_evidence": getattr(self, "_device_evidence", {}),
             "calibration": getattr(self, "_calibration", {}),
         }
+
+    @staticmethod
+    def _attempt_record(
+        started: str | None, outcome: str, ended: str | None
+    ) -> dict[str, Any]:
+        """Build the persisted last_attempt record (CLEAN-02, D-15).
+
+        outcome is one of running, success, failed, capped, stopped, interrupted.
+        """
+        return {"started": started, "ended": ended, "outcome": outcome}
 
     async def async_start(self) -> None:
         """Load candidate and consent stores, start interval timer, and check gates."""
@@ -314,6 +355,19 @@ class LearningSupervisor:
             if stored_learning.get("status") == "running":
                 stored_learning["status"] = "failed"
                 stored_learning["last_error"] = "interrupted"
+                await self._learning_store.async_save(stored_learning)
+
+            # D-15a: a lingering running attempt (the restart killed the run) becomes
+            # interrupted with its start time kept, so the sensor still shows when it
+            # happened. Independent of the status fix-up above.
+            stored_attempt = stored_learning.get("last_attempt")
+            if (
+                isinstance(stored_attempt, dict)
+                and stored_attempt.get("outcome") == "running"
+            ):
+                stored_learning["last_attempt"] = self._attempt_record(
+                    stored_attempt.get("started"), "interrupted", None
+                )
                 await self._learning_store.async_save(stored_learning)
 
             # A last_error stored before 03-10 may carry the key, plain or JSON-escaped:
@@ -336,17 +390,28 @@ class LearningSupervisor:
                 "blocked_reason",
                 "last_run",
                 "last_error",
+                "last_attempt",
                 "tokens_run",
                 "model_mismatch_run",
                 "trimmed_run",
                 "month",
                 "usable_days",
                 "rescore_failures",
+                "evidence_failures",
+                "device_evidence",
             ):
                 if k in stored_learning:
                     c_data[k] = stored_learning[k]
 
             self._rescore_failures = int(c_data.get("rescore_failures", 0))
+            self._evidence_failures = int(c_data.get("evidence_failures", 0))
+            stored_device_evidence = c_data.get("device_evidence")
+            if isinstance(stored_device_evidence, dict):
+                self._device_evidence = {
+                    str(uuid): dict(entry)
+                    for uuid, entry in stored_device_evidence.items()
+                    if isinstance(entry, dict)
+                }
             if "calibration" in stored_learning and isinstance(
                 stored_learning["calibration"], dict
             ):
@@ -382,6 +447,9 @@ class LearningSupervisor:
         # A retrain queued while a job was running (or before a restart)
         # resumes here (D-13); single-flight keeps it behind any job above.
         await self._async_maybe_refit()
+        # D-10: the evidence refresh runs last, so a due rescore at startup keeps
+        # the slot and evidence follows from that rescore's own finally.
+        await self._async_maybe_evidence()
         self._async_arm_schedule()
 
     async def async_stop(self) -> None:
@@ -648,6 +716,9 @@ class LearningSupervisor:
         await self._async_compute_usable_days()
         await self._async_reevaluate_gates()
         await self._async_maybe_rescore()
+        # D-11a: the existing 6-hourly refresh also recomputes aged candidate and
+        # device evidence; all other hook sites leave age unchecked.
+        await self._async_maybe_evidence(include_aged=True)
 
     def _job_active(self) -> bool:
         """Return True while a learning run or rescore is running or being started."""
@@ -1029,6 +1100,7 @@ class LearningSupervisor:
             if self.run_task is task:
                 self.run_task = None
             await self._async_maybe_refit()
+            await self._async_maybe_evidence()
 
     def _plug_names(
         self,
@@ -1608,7 +1680,7 @@ class LearningSupervisor:
             artefact = {
                 k: v
                 for k, v in cand.items()
-                if k not in ("identity", "fingerprint", "first_label")
+                if k not in CANDIDATE_DECORATION_KEYS
             }
             await self.review.async_merge(
                 target_sig,
@@ -1792,6 +1864,8 @@ class LearningSupervisor:
         coord_data["trimmed_run"] = 0
         coord_data["blocked_reason"] = None
         coord_data["last_error"] = None
+        # D-15a: persist the attempt start before any work, so one save records both
+        coord_data["last_attempt"] = self._attempt_record(started, "running", None)
         self.coordinator.async_set_updated_data(coord_data)
         await self._learning_store.async_save(self._build_learning_store_data())
 
@@ -1898,6 +1972,9 @@ class LearningSupervisor:
                 # D-17: the confirmed devices' frozen active versions gate
                 # re-learn proposals in compile_score ({} without devices).
                 actives=devices.gate_actives() if devices is not None else {},
+                # Plan 07-01 (D-11): the production run computes and attaches
+                # per-candidate evidence; the shadow pass below writes False.
+                with_evidence=True,
             )
             best_library = state.best_library
 
@@ -1968,6 +2045,9 @@ class LearningSupervisor:
             await self._candidates_store.async_save(candidates_record)
             self._candidates_record = candidates_record
             self.candidates = best_library
+            # A run's candidates arrive with evidence from compile_score, so the
+            # refresh counter starts over (D-12a).
+            self._reset_evidence_failures()
 
             # 8. Complete run: the shadow pass (D-01) runs after the production
             # candidates are saved and before the idle publish.
@@ -2019,6 +2099,9 @@ class LearningSupervisor:
             c_data = dict(self.coordinator.data)
             c_data["status"] = "capped"
             c_data["last_error"] = f"cap_reached: {cap}"
+            c_data["last_attempt"] = self._attempt_record(
+                started, "capped", dt_util.utcnow().isoformat()
+            )
             if state.best_library:
                 candidates_record = {
                     "run_id": run_id,
@@ -2037,6 +2120,7 @@ class LearningSupervisor:
                 self._candidates_record = candidates_record
                 self.candidates = state.best_library
                 c_data["pending_candidates"] = len(self.visible_candidates())
+                self._reset_evidence_failures()
 
             ir.async_create_issue(
                 self.hass,
@@ -2068,52 +2152,82 @@ class LearningSupervisor:
             c_data = dict(self.coordinator.data)
             c_data["status"] = "failed"
             c_data["last_error"] = f"auth_failed (HTTP {err.status})"[:500]
+            c_data["last_attempt"] = self._attempt_record(
+                started, "failed", dt_util.utcnow().isoformat()
+            )
             self.coordinator.async_set_updated_data(c_data)
             await self._learning_store.async_save(self._build_learning_store_data())
         except LlmBudgetError:
             c_data = dict(self.coordinator.data)
             c_data["status"] = "failed"
             c_data["last_error"] = "provider_budget_exceeded"
+            c_data["last_attempt"] = self._attempt_record(
+                started, "failed", dt_util.utcnow().isoformat()
+            )
             self.coordinator.async_set_updated_data(c_data)
             await self._learning_store.async_save(self._build_learning_store_data())
         except LlmTimeoutError:
             c_data = dict(self.coordinator.data)
             c_data["status"] = "failed"
             c_data["last_error"] = "timeout"
+            c_data["last_attempt"] = self._attempt_record(
+                started, "failed", dt_util.utcnow().isoformat()
+            )
             self.coordinator.async_set_updated_data(c_data)
             await self._learning_store.async_save(self._build_learning_store_data())
         except LlmConnectError:
             c_data = dict(self.coordinator.data)
             c_data["status"] = "failed"
             c_data["last_error"] = "cannot_connect"
+            c_data["last_attempt"] = self._attempt_record(
+                started, "failed", dt_util.utcnow().isoformat()
+            )
             self.coordinator.async_set_updated_data(c_data)
             await self._learning_store.async_save(self._build_learning_store_data())
         except LlmHttpError as err:
             c_data = dict(self.coordinator.data)
             c_data["status"] = "failed"
             c_data["last_error"] = f"http_{err.status}: {err.excerpt}"[:500]
+            c_data["last_attempt"] = self._attempt_record(
+                started, "failed", dt_util.utcnow().isoformat()
+            )
             self.coordinator.async_set_updated_data(c_data)
             await self._learning_store.async_save(self._build_learning_store_data())
         except LlmBadResponse as err:
             c_data = dict(self.coordinator.data)
             c_data["status"] = "failed"
             c_data["last_error"] = str(err.reason)[:500]
+            c_data["last_attempt"] = self._attempt_record(
+                started, "failed", dt_util.utcnow().isoformat()
+            )
             self.coordinator.async_set_updated_data(c_data)
             await self._learning_store.async_save(self._build_learning_store_data())
         except LearningStageError as err:
             c_data = dict(self.coordinator.data)
             c_data["status"] = "failed"
             c_data["last_error"] = f"worker: {err}"[:500]
+            c_data["last_attempt"] = self._attempt_record(
+                started, "failed", dt_util.utcnow().isoformat()
+            )
             self.coordinator.async_set_updated_data(c_data)
             await self._learning_store.async_save(self._build_learning_store_data())
         except LearningRunError as err:
             c_data = dict(self.coordinator.data)
             c_data["status"] = "failed"
             c_data["last_error"] = str(err.code)[:500]
+            c_data["last_attempt"] = self._attempt_record(
+                started, "failed", dt_util.utcnow().isoformat()
+            )
             self.coordinator.async_set_updated_data(c_data)
             await self._learning_store.async_save(self._build_learning_store_data())
         except asyncio.CancelledError:
             # Keep the tokens this run already spent in the persisted month counter (WR-04).
+            # A cancelled (user-stopped) run records its attempt as stopped (D-15).
+            c_data = dict(self.coordinator.data)
+            c_data["last_attempt"] = self._attempt_record(
+                started, "stopped", dt_util.utcnow().isoformat()
+            )
+            self.coordinator.async_set_updated_data(c_data)
             with contextlib.suppress(Exception):
                 await self._learning_store.async_save(self._build_learning_store_data())
             raise
@@ -2122,6 +2236,9 @@ class LearningSupervisor:
             c_data = dict(self.coordinator.data)
             c_data["status"] = "failed"
             c_data["last_error"] = f"{type(err).__name__}: {err}"[:500]
+            c_data["last_attempt"] = self._attempt_record(
+                started, "failed", dt_util.utcnow().isoformat()
+            )
             self.coordinator.async_set_updated_data(c_data)
             await self._learning_store.async_save(self._build_learning_store_data())
         finally:
@@ -2160,6 +2277,7 @@ class LearningSupervisor:
             # The slot is free again: start a queued union retrain, if any
             # (D-13, T-04-25).
             await self._async_maybe_refit()
+            await self._async_maybe_evidence()
 
     async def _async_publish_idle(
         self,
@@ -2191,6 +2309,11 @@ class LearningSupervisor:
         c_data = dict(self.coordinator.data)
         c_data["status"] = "idle"
         c_data["last_run"] = last_run
+        # A successful run completes the attempt with last_run's own timestamps (the
+        # adjacency truth of must_haves: last_attempt_* == last_run_* on success)
+        c_data["last_attempt"] = self._attempt_record(
+            last_run.get("started"), "success", last_run["ended"]
+        )
         c_data["pending_candidates"] = pending_candidates
         c_data["last_error"] = last_error
         ir.async_delete_issue(self.hass, DOMAIN, ISSUE_LEARNING_CAPPED)
@@ -2210,6 +2333,7 @@ class LearningSupervisor:
         decisions: dict[str, Any],
         state: _RoundsState,
         actives: dict[str, Any],
+        with_evidence: bool,
     ) -> None:
         """Run the shared R1 + refinement LLM rounds and compile scores.
 
@@ -2227,7 +2351,10 @@ class LearningSupervisor:
         R1 proposes no devices, state.proposal_empty is set and the caller
         handles the empty exit; a cap raised mid-loop propagates with
         state.best_library holding the last accepted, already-paid-for
-        library.
+        library. ``with_evidence`` is forwarded to the compile job verbatim:
+        the production run passes True and the shadow pass False, and the
+        worker attaches per-candidate evidence only when the job sets that key
+        to exactly True (Plan 07-01, D-11).
         """
         cluster_ids = [c["id"] for c in digest.get("clusters", [])]
         plug_ids = [p["id"] for p in digest.get("plugs", [])]
@@ -2281,6 +2408,12 @@ class LearningSupervisor:
                 # validation block. The shadow pass passes {} (no actives),
                 # so shadow artefacts never produce a gate entry.
                 "actives": actives,
+                # Plan 07-01 (D-11): explicit evidence opt-in for the worker;
+                # the production caller writes True, the shadow caller False.
+                # now_iso stamps each candidate's evidence computed_at, so the
+                # HA-free engine reads no wall-clock time itself.
+                "with_evidence": with_evidence,
+                "now_iso": dt_util.utcnow().isoformat(),
             }
             job_compile_path = stage_dir / f"job_compile_{round_num}.json"
             job_compile_path.write_text(
@@ -2548,6 +2681,9 @@ class LearningSupervisor:
                     # so shadow artefacts never produce a proposal gate, a
                     # device proposal or a rejection record.
                     actives={},
+                    # Plan 07-01: the shadow set stays lean — no evidence is
+                    # computed or stored for shadow artefacts.
+                    with_evidence=False,
                 )
 
             def _write_shadow_library() -> str:
@@ -2648,6 +2784,32 @@ class LearningSupervisor:
 
     async def _async_maybe_rescore_claimed(self) -> None:
         """Start the rescore when due; the caller holds the start slot."""
+        rescore_bounds_ms = await self._async_rescore_due_bounds()
+        if rescore_bounds_ms is None:
+            return
+
+        # Re-check at the point of task creation: the flag may have been latched
+        # by async_stop while this coroutine was suspended in the awaits above
+        # (WR-01 re-review).
+        if self._stopped:
+            return
+
+        self.run_task = self.entry.async_create_background_task(
+            self.hass,
+            self._async_run_rescore(rescore_bounds_ms),
+            "powerguesser_rescore",
+        )
+
+    async def _async_rescore_due_bounds(self) -> list[int] | None:
+        """Return the rescore's daily bounds when a rescore is due, else None (D-10).
+
+        The exact predicate _async_maybe_rescore uses: a preview candidates
+        record (present, candidates, not validated), at least VALIDATED_DAYS
+        usable days, a window_end_ms and at least 2 local-midnight bounds from
+        that window end to today. Extracted unchanged so the evidence hook can
+        evaluate the same rule without duplicating it (a due rescore keeps
+        priority over evidence at every hook site).
+        """
         if self._candidates_record is None:
             data = await self._candidates_store.async_load()
             if data and isinstance(data, dict):
@@ -2655,18 +2817,18 @@ class LearningSupervisor:
                 self.candidates = data.get("candidates", [])
 
         if not self._candidates_record or not self.candidates:
-            return
+            return None
 
         if self._candidates_record.get("validated") is True:
-            return
+            return None
 
         usable_days = await self._async_get_usable_days()
         if usable_days < VALIDATED_DAYS:
-            return
+            return None
 
         window_end_ms = self._candidates_record.get("window_end_ms")
         if not window_end_ms:
-            return
+            return None
 
         now = dt_util.now()
         today_midnight = dt_util.start_of_local_day(now)
@@ -2682,19 +2844,9 @@ class LearningSupervisor:
             cur_date += timedelta(days=1)
 
         if len(rescore_bounds_ms) < 2:
-            return
+            return None
 
-        # Re-check at the point of task creation: the flag may have been latched
-        # by async_stop while this coroutine was suspended in the awaits above
-        # (WR-01 re-review).
-        if self._stopped:
-            return
-
-        self.run_task = self.entry.async_create_background_task(
-            self.hass,
-            self._async_run_rescore(rescore_bounds_ms),
-            "powerguesser_rescore",
-        )
+        return rescore_bounds_ms
 
     async def _async_run_rescore(self, rescore_bounds_ms: list[int]) -> None:
         """Execute local replay rescore of preview candidates without LLM."""
@@ -2755,6 +2907,11 @@ class LearningSupervisor:
                     "metered_channels": metered_channels,
                     "phase_channels": phase_channels,
                     "candidates": self.candidates,
+                    # D-11: explicit evidence opt-in (the worker attaches
+                    # per_signature evidence only when this key is exactly True)
+                    # and the computed_at stamp the HA-free engine reads.
+                    "with_evidence": True,
+                    "now_iso": dt_util.utcnow().isoformat(),
                 }
                 job_path = stage_dir / "job_rescore.json"
                 job_path.write_text(json.dumps(job_rescore, indent=2), encoding="utf-8")
@@ -2787,6 +2944,16 @@ class LearningSupervisor:
                     "learning_split" if vep is not None else None
                 )
                 cand["scores"] = cand_scores
+                # D-11 never-narrow merge: rescore evidence replaces the stored
+                # one only when that is missing, not a dict, of another version,
+                # or covers no more observed days. The comparison is like for
+                # like because every source counts observed_days by the same
+                # evidence window contract.
+                rescore_evidence = stats.get("evidence")
+                if isinstance(rescore_evidence, dict):
+                    stored_evidence = cand.get("evidence")
+                    if self._should_replace_evidence(stored_evidence, rescore_evidence):
+                        cand["evidence"] = rescore_evidence
 
             if self._candidates_record is not None:
                 self._candidates_record["validated"] = True
@@ -2818,6 +2985,11 @@ class LearningSupervisor:
             # union retrain, if any (D-13, T-04-25).
             self.run_task = None
             await self._async_maybe_refit()
+            # This finally is the one site where the rescore has just had its turn:
+            # rescore_attempted=True skips the rescore-due predicate, so evidence
+            # follows even a failing rescore (which stays due and would otherwise
+            # starve it, D-10).
+            await self._async_maybe_evidence(rescore_attempted=True)
 
     async def async_request_refit(self, uuid: str) -> None:
         """Queue or start a local union retrain for a device (D-13, T-04-25).
@@ -2989,6 +3161,345 @@ class LearningSupervisor:
             # queued device retrain, if any.
             self.run_task = None
             await self._async_maybe_refit()
+            await self._async_maybe_evidence()
+
+    # -- evidence refresh (D-10, D-11, D-12, D-18) ------------------------
+
+    def _reset_evidence_failures(self) -> None:
+        """Reset the evidence failure counter (a successful stage or a fresh run)."""
+        self._evidence_failures = 0
+        c_data = dict(self.coordinator.data or {})
+        if c_data.get("evidence_failures") != 0:
+            c_data["evidence_failures"] = 0
+            self.coordinator.async_set_updated_data(c_data)
+
+    def _evidence_targets(self, *, include_aged: bool) -> list[dict[str, Any]]:
+        """Stored candidates whose evidence the refresh stage must (re)compute.
+
+        Only signatures visible in Review are targets: owned, dismissed, merged
+        and suppressed signatures are not. Iterates self.candidates -- never
+        visible_candidates() itself, which also appends
+        devices.unconfirmed_candidates(): those rows are device targets that can
+        never gain candidate evidence, so a predicate over them would stay true
+        forever (Pitfall 3). ``include_aged`` additionally selects evidence whose
+        computed_at is missing, unparsable or older than EVIDENCE_REFRESH_AGE
+        (the 6-hourly refresh only, D-11a).
+        """
+        visible_sigs = {c.get("signature_id") for c in self.visible_candidates()}
+        targets: list[dict[str, Any]] = []
+        for cand in self.candidates:
+            sig_id = cand.get("signature_id")
+            if not sig_id or sig_id not in visible_sigs:
+                continue
+            if self._evidence_needed(cand.get("evidence"), include_aged=include_aged):
+                targets.append(cand)
+        return targets
+
+    @staticmethod
+    def _evidence_needed(evidence: Any, *, include_aged: bool) -> bool:
+        """True when a stored candidate evidence dict must be (re)computed.
+
+        Needed when it is missing, not a dict, of another EVIDENCE_VERSION, or
+        was computed by rescore (a narrower post-preview window that the stage
+        then refreshes over the full window, D-11). With ``include_aged`` a
+        stored entry whose computed_at is missing, unparsable or older than
+        EVIDENCE_REFRESH_AGE is needed too (D-11a).
+        """
+        if not isinstance(evidence, dict) or evidence.get("v") != EVIDENCE_VERSION:
+            return True
+        if evidence.get("source") == "rescore":
+            return True
+        if include_aged:
+            return _evidence_is_aged(evidence)
+        return False
+
+    @staticmethod
+    def _should_replace_evidence(stored: Any, new: Mapping[str, Any]) -> bool:
+        """D-11 never-narrow rule for a rescore evidence merge.
+
+        The stored evidence is replaced only when it is missing, not a dict, of
+        another EVIDENCE_VERSION, or covers no more observed days than the new
+        one. Both sides measure observed_days by the same evidence window
+        contract, so the comparison is like for like.
+        """
+        if not isinstance(stored, dict) or stored.get("v") != EVIDENCE_VERSION:
+            return True
+        stored_days = int((stored.get("window") or {}).get("observed_days") or 0)
+        new_days = int((new.get("window") or {}).get("observed_days") or 0)
+        return new_days >= stored_days
+
+    async def _async_maybe_evidence(
+        self, *, include_aged: bool = False, rescore_attempted: bool = False
+    ) -> None:
+        """Deferred single-flight entry to the evidence refresh stage (D-10, D-12).
+
+        Defers (never raises already_running) while a job holds the slot, and
+        stops once the failure cap is reached. A due rescore keeps priority
+        (D-10): unless rescore_attempted, the claimed part starts nothing while
+        a rescore is due, so evidence follows from that rescore's own finally.
+        """
+        if self._stopped or self._job_active():
+            return
+        if self._evidence_failures >= EVIDENCE_MAX_FAILURES:
+            return
+        self._start_pending = True
+        try:
+            await self._async_maybe_evidence_claimed(include_aged, rescore_attempted)
+        finally:
+            self._start_pending = False
+
+    async def _async_maybe_evidence_claimed(
+        self, include_aged: bool, rescore_attempted: bool
+    ) -> None:
+        """Start the evidence stage when targets exist; the caller holds the slot."""
+        # Drop device_evidence for devices that are gone before computing targets:
+        # a retired or removed device loses its entry at the next hook check,
+        # even when no stage starts.
+        self._prune_device_evidence()
+        cand_targets = self._evidence_targets(include_aged=include_aged)
+        device_targets = self._device_evidence_targets(include_aged=include_aged)
+        if not cand_targets and not device_targets:
+            return
+        if not rescore_attempted and await self._async_rescore_due_bounds() is not None:
+            # A due rescore takes the slot at its own trigger (restart or the
+            # 6-hourly refresh); it never starts here, because that would change
+            # when rescores begin and re-run a failing rescore from this finally.
+            return
+        if self._stopped:
+            return
+        self.run_task = self.entry.async_create_background_task(
+            self.hass,
+            self._async_run_evidence(
+                [str(t.get("signature_id")) for t in cand_targets],
+                device_sources=device_targets,
+            ),
+            "powerguesser_evidence",
+        )
+
+    def _device_evidence_targets(self, *, include_aged: bool) -> list[dict[str, Any]]:
+        """evidence_sources() entries whose device evidence must be (re)computed.
+
+        Needed when the stored entry is missing, not a dict, of another
+        EVIDENCE_VERSION or computed for another active_v, or (``include_aged``
+        only) aged. Reads only devices.evidence_sources(): it never touches a
+        device record (D-07a/D-13).
+        """
+        devices = getattr(self.hub, "devices", None)
+        if devices is None:
+            return []
+        targets: list[dict[str, Any]] = []
+        for source in devices.evidence_sources():
+            uuid = str(source.get("uuid"))
+            stored = self._device_evidence.get(uuid)
+            if not isinstance(stored, dict) or stored.get("v") != EVIDENCE_VERSION:
+                targets.append(source)
+                continue
+            if int(stored.get("active_v") or 0) != int(source.get("active_v") or 0):
+                targets.append(source)
+                continue
+            if include_aged and _evidence_is_aged(stored):
+                targets.append(source)
+        return targets
+
+    def _prune_device_evidence(self) -> None:
+        """Drop device_evidence entries whose uuid is no longer an evidence source.
+
+        A retired or removed device loses its evidence entry at the next hook
+        check even when no stage starts; the next learning Store save persists
+        the pruned map. Not called from _build_learning_store_data: that is a
+        plain serializer used at every save site, and a pruning side effect there
+        would couple every save to the device view.
+        """
+        if not self._device_evidence:
+            return
+        devices = getattr(self.hub, "devices", None)
+        if devices is None:
+            return
+        live = {str(source.get("uuid")) for source in devices.evidence_sources()}
+        for uuid in [u for u in self._device_evidence if u not in live]:
+            del self._device_evidence[uuid]
+
+    def device_evidence(self, uuid: str) -> dict[str, Any] | None:
+        """Stored device evidence, or the confirmed-from candidate's evidence (D-07a).
+
+        The stored entry wins while it is a dict of the current
+        EVIDENCE_VERSION (an entry for an older active_v keeps showing until the
+        refresh replaces it). As a read-time fallback for a just-confirmed device
+        (confirm starts no job, so no stage has run since), the evidence of the
+        candidate whose signature_id is the record's signature_id is returned
+        when it is a dict of the current version; nothing is copied into the
+        record (D-13, resolve at read time).
+        """
+        stored = self._device_evidence.get(str(uuid))
+        if isinstance(stored, dict) and stored.get("v") == EVIDENCE_VERSION:
+            return stored
+        devices = getattr(self.hub, "devices", None)
+        record = devices.record(str(uuid)) if devices is not None else None
+        sig_id = str((record or {}).get("signature_id") or "")
+        if sig_id:
+            for cand in self.candidates:
+                if str(cand.get("signature_id")) != sig_id:
+                    continue
+                evidence = cand.get("evidence")
+                if isinstance(evidence, dict) and evidence.get("v") == EVIDENCE_VERSION:
+                    return evidence
+                break
+        return None
+
+    async def _merge_evidence(
+        self, evidence_map: Mapping[str, Any], device_sources: Sequence[Any]
+    ) -> None:
+        """Merge a stage result into candidates and device evidence (D-07a, T-07-11).
+
+        Candidate evidence merges by signature_id only into candidates still
+        present: a candidate removed mid-stage is never resurrected. Device
+        entries merge only for the uuids the stage was sent (still among
+        evidence_sources()), recording the active_v the artefact was computed
+        for, so a later version change re-targets the entry.
+        """
+        changed = False
+        device_by_key = {
+            f"device:{source['uuid']}": (
+                str(source["uuid"]),
+                int(source.get("active_v") or 0),
+            )
+            for source in device_sources
+        }
+        for key, entry in evidence_map.items():
+            if not isinstance(entry, dict):
+                continue
+            device = device_by_key.get(str(key))
+            if device is not None:
+                uuid, active_v = device
+                stored = self._device_evidence.get(uuid)
+                # An unparsable artefact yields an n_runs-0 entry (the deliberate
+                # D-12b anti-loop mechanism). Keep a good stored entry rather than
+                # clobber it, but ALWAYS replace a missing or stale one: a stale
+                # entry (wrong EVIDENCE_VERSION or active_v) keeps
+                # _device_evidence_targets true, so the success path would re-run
+                # the stage from its finally without bound (MR !17 notes 4917/4921).
+                if (
+                    entry.get("n_runs")
+                    or not isinstance(stored, dict)
+                    or stored.get("v") != EVIDENCE_VERSION
+                    or int(stored.get("active_v") or 0) != active_v
+                ):
+                    self._device_evidence[uuid] = {**entry, "active_v": active_v}
+                    changed = True
+        for cand in self.candidates:
+            sig_id = str(cand.get("signature_id"))
+            evidence = evidence_map.get(sig_id)
+            if isinstance(evidence, dict):
+                existing = cand.get("evidence")
+                # Same rule as the device path: keep a good entry rather than
+                # clobber it with an n_runs-0 entry, but always replace a stale one
+                # (older EVIDENCE_VERSION, or source == "rescore") — otherwise
+                # _evidence_needed stays true and the success path re-runs the
+                # stage from its finally without bound (MR !17 notes 4917/4922).
+                if (
+                    evidence.get("n_runs")
+                    or self._evidence_needed(existing, include_aged=False)
+                ):
+                    cand["evidence"] = evidence
+                    changed = True
+        self._prune_device_evidence()
+        if changed and self._candidates_record is not None:
+            self._candidates_record["candidates"] = self.candidates
+            await self._candidates_store.async_save(self._candidates_record)
+
+    async def _async_run_evidence(
+        self, sig_ids: Sequence[str], *, device_sources: Sequence[Any] = ()
+    ) -> None:
+        """Run the worker evidence stage for the given candidate signatures.
+
+        Mirrors _async_run_refit's job shape, except the stage directory is
+        created and removed in the executor (never on the event loop, project
+        constraint). D-18: status is untouched; only running_job becomes
+        "evidence", so a restart during the stage never reads as failed.
+        """
+        sig_id_set = {str(s) for s in sig_ids}
+        c_data = dict(self.coordinator.data)
+        c_data["running_job"] = "evidence"
+        self.coordinator.async_set_updated_data(c_data)
+
+        stage_dir: Path | None = None
+        evidence_succeeded = False
+        try:
+            # The executor thread must not read supervisor state the loop
+            # mutates: build the plain deep-copied job inputs here, on the loop.
+            cand_artefacts = [
+                copy.deepcopy(c)
+                for c in self.candidates
+                if str(c.get("signature_id")) in sig_id_set
+            ]
+            device_artefacts = [
+                dict(
+                    copy.deepcopy(source["artefact"]),
+                    signature_id=f"device:{source['uuid']}",
+                )
+                for source in device_sources
+            ]
+            now_iso = dt_util.utcnow().isoformat()
+
+            def _prepare_evidence(
+                cand_artefacts: list[dict[str, Any]],
+                device_artefacts: list[dict[str, Any]],
+                now_iso: str,
+            ) -> tuple[Path, Path]:
+                new_dir = Path(tempfile.mkdtemp(prefix="powerguesser-evidence-"))
+                # Only job_extract is used, and never via shadow=True: the shadow
+                # job empties metered_channels, which changes the residual and
+                # would break the cross-plan evidence window contract.
+                job_extract, _cache_key, _window_end_ms = self._build_extract_job_data(
+                    new_dir
+                )
+                job = {
+                    **job_extract,
+                    "stage_dir": str(new_dir),
+                    "candidates": cand_artefacts + device_artefacts,
+                    "now_iso": now_iso,
+                }
+                job_path = new_dir / "job_evidence.json"
+                job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+                return new_dir, job_path
+
+            stage_dir, job_path = await self.hass.async_add_executor_job(
+                _prepare_evidence, cand_artefacts, device_artefacts, now_iso
+            )
+            res = _require_outputs(
+                "evidence", await self._async_run_stage("evidence", job_path)
+            )
+
+            def _read_evidence(path: str) -> dict[str, Any]:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+
+            evidence_map = await self.hass.async_add_executor_job(
+                _read_evidence, str(res["result"])
+            )
+
+            await self._merge_evidence(evidence_map, device_sources)
+            evidence_succeeded = True
+            self._reset_evidence_failures()
+        except Exception as err:  # noqa: BLE001 - a stage failure is counted, never raised
+            _LOGGER.warning("Evidence refresh failed: %s", err)
+            self._evidence_failures += 1
+            c_data = dict(self.coordinator.data)
+            c_data["evidence_failures"] = self._evidence_failures
+            self.coordinator.async_set_updated_data(c_data)
+        finally:
+            if stage_dir is not None:
+                await self.hass.async_add_executor_job(shutil.rmtree, stage_dir, True)
+            c_data = dict(self.coordinator.data)
+            c_data["running_job"] = None
+            self.coordinator.async_set_updated_data(c_data)
+            await self._learning_store.async_save(self._build_learning_store_data())
+            self.run_task = None
+            if evidence_succeeded:
+                # D-12b: only a SUCCESS re-checks the hook from its own finally; a
+                # failure waits for the next natural trigger, so the cap is spread
+                # over time rather than spent in one burst.
+                await self._async_maybe_evidence()
 
     async def _async_run_stage(
         self, stage: str, job_path: Path | str
@@ -3057,6 +3568,16 @@ class LearningSupervisor:
                     done_payload = event
                 elif ev_type == "error":
                     last_error = event.get("error", "Unknown worker error")
+                elif ev_type == "progress" and event.get("step") == "skipped":
+                    # IN-01: the reader drops every non-`done`/`error` event, so
+                    # a per-artefact skip would otherwise leave no trace. Surface
+                    # it in the HA log here; the batch still succeeds.
+                    _LOGGER.warning(
+                        "Learning stage %s skipped an unusable artefact (id=%s): %s",
+                        stage,
+                        event.get("id"),
+                        event.get("error"),
+                    )
 
             await proc.wait()
             await drain_task

@@ -427,6 +427,13 @@ async def test_auth_failure_raises_fixable_issue_and_keeps_power_sensors(
     assert data["status"] == "failed"
     assert "auth_failed (HTTP 401)" in data["last_error"]
 
+    # The one failure class with a Repairs side effect carries the same
+    # last_attempt guarantee (review round 1)
+    assert data["last_attempt"]["outcome"] == "failed"
+    assert data["last_attempt"]["started"] is not None
+    assert data["last_attempt"]["ended"] is not None
+    assert data["last_run"] is None
+
     # Gross sensor still exists and is available
     gross_state = hass.states.get("sensor.powerguesser_gross_power")
     assert gross_state is not None
@@ -572,6 +579,8 @@ async def test_plain_failures_set_failed_without_issue(
             },
             "provider_budget_exceeded",
         ),
+        # LlmBadResponse: a 200 body that does not parse (llm_client ~410)
+        ({"status": 200, "text": "not json"}, "invalid_json"),
     ]
 
     for responder_spec, expected_error in test_cases:
@@ -587,6 +596,9 @@ async def test_plain_failures_set_failed_without_issue(
         assert data["last_error"] is not None
         assert data["last_error"] == expected_error
         assert len(data["last_error"]) <= 500
+        assert data["last_attempt"]["outcome"] == "failed"
+        assert data["last_attempt"]["started"] is not None
+        assert data["last_attempt"]["ended"] is not None
         assert issue_reg.async_get_issue(DOMAIN, ISSUE_LLM_AUTH) is None
 
     # Worker error case
@@ -602,6 +614,8 @@ async def test_plain_failures_set_failed_without_issue(
     assert data["status"] == "failed"
     assert data["last_error"] == "worker: memory limit exceeded in clustering"
     assert len(data["last_error"]) <= 500
+    assert data["last_attempt"]["outcome"] == "failed"
+    assert data["last_attempt"]["ended"] is not None
     assert issue_reg.async_get_issue(DOMAIN, ISSUE_LLM_AUTH) is None
 
 

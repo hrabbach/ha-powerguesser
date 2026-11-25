@@ -914,6 +914,145 @@ def test_compile_score_gates_differing_matches_only_with_actives(tmp_path: Path)
     assert equal_entry["proposal_gate"]["proposed_S"] == equal_entry["proposal_gate"]["active_S"]
 
 
+_EVIDENCE_NOW = "2026-11-25T07:00:00+00:00"
+
+
+def _compile_kettle(
+    tmp_path: Path,
+    *,
+    name: str,
+    job_extra: dict | None = None,
+    prior: list[dict] | None = None,
+    drop_residual: bool = False,
+    run_id: str | None = None,
+) -> tuple[Path, list[dict]]:
+    """Run the extract -> proposal -> compile_score recipe; return (stage_dir, library dicts)."""
+    dt = datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc)
+    end_ms = int(dt.timestamp() * 1000)
+    days = 22
+    day_bounds_ms = utc_day_bounds(end_ms, days)
+
+    buf_path = tmp_path / f"buf_{name}.sqlite"
+    stage_dir = tmp_path / f"stage_{name}"
+    build_buffer(buf_path, SynthSpec(days=days), end_ms)
+
+    start_dt = datetime.fromtimestamp(day_bounds_ms[0] / 1000.0, tz=timezone.utc)
+    first_weekday = start_dt.weekday()
+
+    extract_job = {
+        "schema": 1,
+        "buffer_path": str(buf_path),
+        "stage_dir": str(stage_dir),
+        "grid_s": 30,
+        "day_bounds_ms": day_bounds_ms,
+        "first_weekday": first_weekday,
+        "holdout_days": 0,
+        "train_fraction": 0.7,
+        "enabled_event_types": ["step", "cycle_shape", "continuous"],
+        "metered_channels": [],
+        "phase_channels": {},
+    }
+    extract_res = run_stage("extract", extract_job)
+    digest = extract_res["digest"]
+
+    proposal = kettle_proposal(digest)
+    message = chat_completion(json.dumps(proposal))["choices"][0]["message"]
+    cluster_ids = [c["id"] for c in digest["clusters"]]
+    valid_prop, errors, _ = parse_proposal(message, cluster_ids=cluster_ids, plug_ids=[])
+    assert valid_prop is not None, f"Proposal validation failed: {errors}"
+
+    proposal_path = stage_dir / "proposal_1.json"
+    with open(proposal_path, "w", encoding="utf-8") as f:
+        json.dump(valid_prop, f)
+
+    compile_job = {
+        "stage_dir": str(stage_dir),
+        "run_id": run_id or f"test-{name}",
+        "round": 1,
+        "model": "fake-model",
+        "proposal_path": str(proposal_path),
+        "incumbent": None,
+        "validated": True,
+        "prior": prior or [],
+        "decisions": {},
+    }
+    if job_extra:
+        compile_job.update(job_extra)
+    if drop_residual:
+        (stage_dir / "residual.npz").unlink()
+
+    compile_res = run_stage("compile_score", compile_job)
+    with open(compile_res["library"], "r", encoding="utf-8") as f:
+        library = json.load(f)
+    assert library
+    return stage_dir, library
+
+
+def test_compile_attaches_evidence_by_original_id(tmp_path: Path) -> None:
+    """D-11: evidence is keyed by the ORIGINAL artefact id even when match_identities rewrites it."""
+    _, first_library = _compile_kettle(
+        tmp_path, name="ev1", job_extra={"with_evidence": True, "now_iso": _EVIDENCE_NOW}
+    )
+    prior_kettle = {**first_library[0], "signature_id": "prior-kettle-id"}
+    prior_kettle.pop("evidence", None)
+
+    _, second_library = _compile_kettle(
+        tmp_path,
+        name="ev2",
+        job_extra={"with_evidence": True, "now_iso": _EVIDENCE_NOW},
+        prior=[prior_kettle],
+    )
+
+    matched = [d for d in second_library if d["signature_id"] == "prior-kettle-id"]
+    assert matched, [d["signature_id"] for d in second_library]
+    assert matched[0]["evidence"]["n_runs"] > 0
+    assert matched[0]["evidence"]["source"] == "run"
+
+
+@pytest.mark.parametrize(
+    "job_extra", [{"with_evidence": False}, {}], ids=["false", "absent"]
+)
+def test_compile_without_evidence_flag(tmp_path: Path, job_extra: dict) -> None:
+    """D-11: only an explicit with_evidence True attaches evidence (golden/shadow jobs stay clean)."""
+    _, library = _compile_kettle(
+        tmp_path, name="noflag", job_extra={"now_iso": _EVIDENCE_NOW, **job_extra}
+    )
+    assert all("evidence" not in d for d in library)
+
+
+def test_compile_without_residual_skips_evidence(tmp_path: Path) -> None:
+    """A missing residual.npz skips the attach without error and without changing ids."""
+    _, with_library = _compile_kettle(
+        tmp_path,
+        name="res1",
+        job_extra={"with_evidence": True, "now_iso": _EVIDENCE_NOW},
+        run_id="test-residual",
+    )
+    _, without_library = _compile_kettle(
+        tmp_path,
+        name="res2",
+        job_extra={"with_evidence": True, "now_iso": _EVIDENCE_NOW},
+        drop_residual=True,
+        run_id="test-residual",
+    )
+
+    assert [d["signature_id"] for d in with_library] == [
+        d["signature_id"] for d in without_library
+    ]
+    assert all("evidence" not in d for d in without_library)
+
+
+def test_learned_candidate_has_no_fingerprint_documented_gap(tmp_path: Path) -> None:
+    """D-21 pin: a real compile_score library dict carries no "fingerprint" key.
+
+    Phase 8 previews want a fingerprint on learned candidates; adding one would
+    change identity and dismiss behaviour, so it stays a documented v1.0 gap
+    whose fix is a Phase 8 prerequisite. This test flips when Phase 8 fixes it.
+    """
+    _, library = _compile_kettle(tmp_path, name="fingerprint")
+    assert all("fingerprint" not in d for d in library)
+
+
 def test_dedup_share_inputs_exact() -> None:
     """D-20: pin the exact per-signature claimed/unique Wh feeding shares, scorecard and the D-21 confidence."""
     from custom_components.powerguesser.engine.learning.score import replay, scorecard

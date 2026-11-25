@@ -104,7 +104,8 @@ runner publishes its progress through `bootstrap_coordinator` to
    `ionice -c3` when available, with BLAS thread counts pinned to 1 and a
    `STAGE_TIMEOUT_S` timeout. The worker reports progress as JSON-lines events on stdout.
    The stage sequence is defined in engine/learning/worker.py:
-   `extract → compile_score → rescore → refit → validate → validate_sessions → shadow_link`.
+   `extract → compile_score → rescore → refit → validate → validate_sessions → shadow_link →
+   evidence`.
 3. `extract` reads the residual series from the buffer (engine/learning/series.py), detects
    edges and episodes (episodes.py), clusters features with DBSCAN (digest.py), and emits a
    canonical digest. The supervisor builds the prompt (engine/learning/prompts.py) and calls
@@ -113,8 +114,15 @@ runner publishes its progress through `bootstrap_coordinator` to
 4. The LLM proposal is validated and sanitised (engine/learning/proposal.py), compiled into
    `SignatureArtefact` records with locally refitted state boxes (compile.py, stages.py),
    replayed and scored on a whole-day train/holdout split (score.py, split.py), and matched
-   against prior candidates to preserve user decisions across runs (identity.py).
-5. Surviving candidates land in the review store (review_store.py). The user confirms,
+   against prior candidates to preserve user decisions across runs (identity.py). After identity
+   matching, `compile_score` attaches per-candidate **evidence** (build_evidence in
+   engine/learning/evidence.py) from the same episode rows the learner scored.
+5. The `evidence` worker stage refreshes that evidence in the same single-flight slot: at the end
+   of `async_start`, after every released job (run, rescore, refit, stage — after the rescore hook
+   so a due rescore keeps priority), and from the existing 6-hourly timer once a candidate's
+   evidence is older than about 7 days. It sends no LLM request. This is the refresh path for
+   pre-upgrade candidates and for validated candidates that never rescore again.
+6. Surviving candidates land in the review store (review_store.py). The user confirms,
    renames, merges, or dismisses them through config-flow subentries; confirmation turns a
    candidate into a device record managed by `DeviceRuntime`, whose artefact is compiled into
    a `DeviceModel`/`ProgramModel` for the online detector.
@@ -148,6 +156,8 @@ subtracted live from the remainder exactly once (hub.py).
 | `ValidationManager` | `custom_components/powerguesser/validation.py` | Shadow/validation stores and the `run_validation` holdout pipeline. |
 | `DeviceRuntime` | `custom_components/powerguesser/devices.py` | Confirmed-device records, online-detector wiring, and per-device sensor state. |
 | `ConsentStore` | `custom_components/powerguesser/consent.py` | Persisted, destination-bound LLM consent records. |
+| `review_actions` | `custom_components/powerguesser/review_actions.py` | Shared review backend for the options flow (and the later panel): confirm / rename / dismiss / merge for candidates and devices with typed errors, plus `evidence_view` and `evidence_text`. |
+| `build_evidence` / evidence statistics | `custom_components/powerguesser/engine/learning/evidence.py` | HA-free per-candidate evidence: recent occurrences, rhythm, power/energy profile and heuristic hints. Pure, so the flow, the worker stage and the later panel reuse it. |
 
 ## Directory structure rationale
 
@@ -158,6 +168,7 @@ custom_components/powerguesser/        Home Assistant integration package
 ├── hub.py, buffer_writer.py           Runtime coordinator and buffer write path
 ├── learning.py, validation.py         Supervisors for the worker subprocess pipelines
 ├── devices.py, review_store.py        Confirmed devices and candidate review state
+├── review_actions.py                  Shared review backend (confirm/rename/dismiss/merge, evidence view)
 ├── llm_client.py, consent.py          LLM transport and consent (learning phase only)
 ├── sensor.py, button.py               Entity platforms
 ├── repairs.py, issues.py              Repairs issue reconciliation
@@ -170,7 +181,7 @@ custom_components/powerguesser/        Home Assistant integration package
     ├── llm_wire.py                         LLM wire formats and probe strategy (pure)
     ├── worker_entry.py                     Standalone subprocess entrypoint
     ├── detect/                             Online detection (stream, online, joint, program, replay)
-    ├── learning/                           Learning stages (episodes, digest, prompts, compile, score, split, worker)
+    ├── learning/                           Learning stages (episodes, digest, prompts, compile, score, split, evidence, worker)
     └── validation/                         Holdout validation (link, metrics, classes, drift, report)
 
 tests/                Test suites mirroring the layer split

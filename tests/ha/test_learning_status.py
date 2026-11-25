@@ -57,6 +57,9 @@ async def test_learning_status_sensor_initial_state(
     assert attrs.get("options") == ["idle", "running", "blocked", "capped", "failed"]
     assert attrs.get("last_run_start") is None
     assert attrs.get("last_run_end") is None
+    assert attrs.get("last_attempt_start") is None
+    assert attrs.get("last_attempt_end") is None
+    assert attrs.get("last_attempt_outcome") is None
     assert attrs.get("last_result") is None
     assert attrs.get("last_error") is None
     assert attrs.get("pending_candidates") == 0
@@ -83,9 +86,11 @@ async def test_learning_status_sensor_lifecycle(
     await async_seed_consent(hass, host="llm.test", names=False)
 
     unblock_llm = asyncio.Event()
+    entered_llm = asyncio.Event()
     base_resp = proposal_responder(2)
 
     async def _waiting_responder(data: object) -> dict:
+        entered_llm.set()
         await unblock_llm.wait()
         return base_resp(data)
 
@@ -94,11 +99,23 @@ async def test_learning_status_sensor_lifecycle(
     supervisor = entry.runtime_data.learning
     # Start run
     await supervisor.async_request_run("service")
-    await asyncio.sleep(0.1)
+    await asyncio.wait_for(entered_llm.wait(), timeout=10)
+
+    # The run-start save persisted last_attempt as running before the LLM call (D-15a)
+    mid_store = await Store(
+        hass, LEARNING_STORES_VERSION, LEARNING_STORE_KEY
+    ).async_load()
+    assert mid_store["last_attempt"]["outcome"] == "running"
+    assert mid_store["last_attempt"]["ended"] is None
+    started_seen = mid_store["last_attempt"]["started"]
+    assert started_seen is not None
+    assert started_seen == supervisor.coordinator.data["last_attempt"]["started"]
 
     state = hass.states.get("sensor.powerguesser_learning_status")
     assert state is not None
     assert state.state == "running"
+    assert state.attributes["last_attempt_outcome"] == "running"
+    assert state.attributes["last_attempt_end"] is None
 
     unblock_llm.set()
     await supervisor.run_task
@@ -112,6 +129,11 @@ async def test_learning_status_sensor_lifecycle(
     assert attrs["pending_candidates"] >= 1
     assert attrs["tokens_this_run"] > 0
     assert attrs["tokens_this_month"] > 0
+
+    # A successful run completes last_attempt with the same timestamps as last_run
+    assert attrs["last_attempt_outcome"] == "success"
+    assert attrs["last_attempt_start"] == attrs["last_run_start"] == started_seen
+    assert attrs["last_attempt_end"] == attrs["last_run_end"]
 
     last_res = attrs["last_result"]
     assert last_res is not None
@@ -203,6 +225,7 @@ async def test_interrupted_run_loads_as_failed(
     inprocess_worker: None,
 ) -> None:
     """Test learning Store saved as running loads as failed with last_error 'interrupted'."""
+    interrupted_started = "2026-11-24T05:00:00+00:00"
     # Seed learning store with running status before setting up entry
     store = Store(hass, LEARNING_STORES_VERSION, LEARNING_STORE_KEY)
     await store.async_save(
@@ -211,6 +234,11 @@ async def test_interrupted_run_loads_as_failed(
             "blocked_reason": None,
             "last_run": None,
             "last_error": None,
+            "last_attempt": {
+                "started": interrupted_started,
+                "ended": None,
+                "outcome": "running",
+            },
             "tokens_run": {"input": 100, "output": 50},
             "month": {"key": "2026-11", "input": 100, "output": 50, "cost": None},
             "usable_days": {"value": 15.0, "computed_at": None},
@@ -226,6 +254,11 @@ async def test_interrupted_run_loads_as_failed(
     assert state.state == "failed"
     assert state.attributes.get("last_error") == "interrupted"
 
+    # D-15a: a lingering running attempt loads as interrupted with its start kept
+    assert state.attributes.get("last_attempt_outcome") == "interrupted"
+    assert state.attributes.get("last_attempt_start") == interrupted_started
+    assert state.attributes.get("last_attempt_end") is None
+
     # Verify that the next trigger starts a fresh run
     await async_fill_synth_buffer(hass, entry, spec=SynthSpec(days=22, washer=True))
     await async_seed_llm(hass, entry, base_url="http://llm.test/v1")
@@ -237,6 +270,91 @@ async def test_interrupted_run_loads_as_failed(
     assert supervisor.run_task is not None
     await supervisor.run_task
     assert supervisor.coordinator.data["status"] == "idle"
+
+
+async def test_failed_attempt_keeps_last_run_and_survives_restart(
+    hass: HomeAssistant,
+    energy_manager: object,
+    std_prefs: dict,
+    aioclient_mock: object,
+    inprocess_worker: None,
+) -> None:
+    """A failed run records last_attempt but leaves last_run, and survives a restart (CLEAN-02)."""
+    energy_manager.data = std_prefs
+    _set_std_powers(hass)
+    entry = await async_setup_via_flow(hass)
+    await async_fill_synth_buffer(hass, entry, spec=SynthSpec(days=22, washer=True))
+    await async_seed_llm(hass, entry, base_url="http://llm.test/v1")
+    await async_seed_consent(hass, host="llm.test", names=False)
+
+    supervisor = entry.runtime_data.learning
+
+    # 1. A successful run first: last_run now points at a success
+    mock_llm(aioclient_mock, "http://llm.test/v1", proposal_responder(2))
+    await supervisor.async_request_run("service")
+    await supervisor.run_task
+    success_last_run = dict(supervisor.coordinator.data["last_run"])
+    state = hass.states.get("sensor.powerguesser_learning_status")
+    assert state.attributes["last_attempt_outcome"] == "success"
+
+    # 2. A failing run (HTTP 500) records a failed attempt but leaves last_run
+    aioclient_mock.clear_requests()
+    mock_llm(
+        aioclient_mock,
+        "http://llm.test/v1",
+        lambda _r: {"status": 500, "text": "Internal Server Error"},
+    )
+    await supervisor.async_request_run("service")
+    await supervisor.run_task
+
+    state = hass.states.get("sensor.powerguesser_learning_status")
+    assert state.attributes["last_attempt_outcome"] == "failed"
+    assert state.attributes["last_attempt_start"] is not None
+    assert state.attributes["last_attempt_end"] is not None
+    assert supervisor.coordinator.data["last_run"] == success_last_run
+
+    stored = await Store(hass, LEARNING_STORES_VERSION, LEARNING_STORE_KEY).async_load()
+    failed_attempt = dict(stored["last_attempt"])
+    assert failed_attempt["outcome"] == "failed"
+
+    # 3. A restart restores the same last_attempt and the same last_run
+    new_supervisor = type(supervisor)(hass, entry, supervisor.hub)
+    await new_supervisor.async_start()
+    try:
+        assert new_supervisor.coordinator.data["last_attempt"] == failed_attempt
+        assert new_supervisor.coordinator.data["last_run"] == success_last_run
+    finally:
+        await new_supervisor.async_stop()
+
+    # 4. A further successful run overwrites it with success (newest attempt wins)
+    aioclient_mock.clear_requests()
+    mock_llm(aioclient_mock, "http://llm.test/v1", proposal_responder(2))
+    await supervisor.async_request_run("service")
+    await supervisor.run_task
+    state = hass.states.get("sensor.powerguesser_learning_status")
+    assert state.attributes["last_attempt_outcome"] == "success"
+    assert state.attributes["last_attempt_start"] == state.attributes["last_run_start"]
+
+
+def test_last_attempt_attributes_are_unrecorded() -> None:
+    """The three last_attempt_* attributes are unrecorded and _attr_options is unchanged (D-15, D-18)."""
+    from custom_components.powerguesser.sensor import LearningStatusSensor
+
+    assert LearningStatusSensor._unrecorded_attributes >= {
+        "last_attempt_start",
+        "last_attempt_end",
+        "last_attempt_outcome",
+    }
+    # _attr_options is a CachedProperties descriptor (a class-level property), so it
+    # must be read off an instance, never off the class.
+    sensor = LearningStatusSensor.__new__(LearningStatusSensor)
+    assert sensor._attr_options == [
+        "idle",
+        "running",
+        "blocked",
+        "capped",
+        "failed",
+    ]
 
 
 @pytest.mark.parametrize(

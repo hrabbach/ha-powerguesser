@@ -35,6 +35,7 @@ from homeassistant.helpers.storage import Store
 import homeassistant.util.dt as dt_util
 
 from .const import (
+    CANDIDATE_DECORATION_KEYS,
     DEVICES_STORE_KEY,
     DEVICES_STORE_VERSION,
     DEVICE_STATE_SAVE_DELAY_S,
@@ -1206,7 +1207,7 @@ class DeviceRuntime:
         art = {
             k: v
             for k, v in artefact.items()
-            if k not in ("identity", "fingerprint", "first_label")
+            if k not in CANDIDATE_DECORATION_KEYS
         }
         rec["pending_proposal"] = {
             "artefact": art,
@@ -1532,6 +1533,39 @@ class DeviceRuntime:
             )
         self._retired_problems = retired
         self._issues.apply([*self._device_problems, *self._retired_problems])
+
+    def evidence_sources(self) -> list[dict[str, Any]]:
+        """Read-only evidence targets: records with a usable active artefact (D-07a).
+
+        One entry per record whose status is "confirmed" or "unconfirmed" and
+        whose active version carries a usable artefact, sorted by uuid:
+        ``{"uuid", "signature_id", "status", "active_v", "artefact"}``. Retired
+        records are excluded (Review never shows them) and no record key is
+        added, so DEVICE_RECORD_DEFAULTS and test_device_store_schema.py stay
+        unchanged. The supervisor sends each artefact to the evidence stage
+        re-keyed as ``device:<uuid>`` and never reads a record itself.
+        """
+        out: list[dict[str, Any]] = []
+        for dev_uuid, rec in sorted(self._devices.items()):
+            if rec.get("status") not in ("confirmed", "unconfirmed"):
+                continue
+            artefact = self._active_artefact(rec)
+            if artefact is None:
+                continue
+            try:
+                active_v = int(rec.get("active_v") or 0)
+            except (TypeError, ValueError):
+                active_v = 0
+            out.append(
+                {
+                    "uuid": str(dev_uuid),
+                    "signature_id": str(rec.get("signature_id") or ""),
+                    "status": str(rec.get("status") or ""),
+                    "active_v": active_v,
+                    "artefact": dict(artefact),
+                }
+            )
+        return out
 
     def unconfirmed_candidates(self) -> list[dict[str, Any]]:
         """Candidate-shaped dicts for unconfirmed records (D-05).
@@ -2315,7 +2349,7 @@ class DeviceRuntime:
         artefact = {
             k: v
             for k, v in candidate.items()
-            if k not in ("identity", "fingerprint", "first_label")
+            if k not in CANDIDATE_DECORATION_KEYS
         }
         scores = dict(candidate.get("scores") or {})
 

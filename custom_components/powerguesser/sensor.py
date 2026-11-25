@@ -332,6 +332,9 @@ class LearningStatusSensor(
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = ["idle", "running", "blocked", "capped", "failed"]
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    # Failure counters (``evidence_failures``, ``rescore_failures``) are
+    # deliberately NOT listed here: both are low-cardinality counters kept in
+    # recorder history for trend debugging.
     _unrecorded_attributes = frozenset(
         {
             "tokens_this_run",
@@ -339,6 +342,9 @@ class LearningStatusSensor(
             "cost_this_month",
             "last_error",
             "last_result",
+            "last_attempt_start",
+            "last_attempt_end",
+            "last_attempt_outcome",
             "model_mismatch_this_run",
             "trimmed_this_run",
         }
@@ -416,9 +422,20 @@ class LearningStatusSensor(
         buffer_usable_days = usable_days_data.get("value")
         llm_model_mismatch, llm_model_returned = self._probe_model_attrs()
 
+        # CLEAN-02 (D-15): the newest attempt, whatever its outcome. outcome is one of
+        # running, success, failed, capped, stopped, interrupted ("interrupted" is the
+        # D-15a restore value for a run the previous process left still running -- an
+        # unclean restart; a graceful restart records it as "stopped").
+        last_attempt = data.get("last_attempt")
+        if not isinstance(last_attempt, dict):
+            last_attempt = {}
+
         return {
             "last_run_start": last_run.get("started") if last_run else None,
             "last_run_end": last_run.get("ended") if last_run else None,
+            "last_attempt_start": last_attempt.get("started"),
+            "last_attempt_end": last_attempt.get("ended"),
+            "last_attempt_outcome": last_attempt.get("outcome"),
             "last_result": last_result,
             "pending_candidates": data.get("pending_candidates", 0),
             "tokens_this_run": tokens_this_run,
@@ -426,6 +443,7 @@ class LearningStatusSensor(
             "cost_this_month": cost_this_month,
             "running_job": data.get("running_job"),
             "rescore_failures": data.get("rescore_failures", 0),
+            "evidence_failures": data.get("evidence_failures", 0),
             "last_error": data.get("last_error"),
             "buffer_usable_days": buffer_usable_days,
             "blocked_reason": data.get("blocked_reason"),

@@ -95,7 +95,7 @@ async def test_diagnostics_top_level_and_aggregates(
 
     diag = await async_get_config_entry_diagnostics(hass, entry)
 
-    # Exactly top-level keys: buffer, profiles, effective, bootstrap, options, data
+    # Exactly top-level keys: buffer, profiles, effective, bootstrap, options, data, llm_probe
     assert set(diag.keys()) == {
         "buffer",
         "profiles",
@@ -103,7 +103,10 @@ async def test_diagnostics_top_level_and_aggregates(
         "bootstrap",
         "options",
         "data",
+        "llm_probe",
     }
+    # No probe was configured in this entry, so the allow-list key is None
+    assert diag["llm_probe"] is None
 
     # buffer section
     buf = diag["buffer"]
@@ -213,6 +216,112 @@ async def test_diagnostics_redacts_api_key(
     assert diag["data"][CONF_LLM_API_KEY] == "**REDACTED**"
     assert secret_key not in str(diag)
 
+    # CLEAN-01 (D-16): the probe result is a top-level six-key allow-list copied
+    # verbatim from entry.data; a probe stored without model_mismatch reads None
+    # and is never recomputed.
+    assert diag["llm_probe"] == {
+        "strategy": "json_schema",
+        "token_param": "max_completion_tokens",
+        "send_temperature": True,
+        "model_returned": "m1-2026",
+        "model_mismatch": None,
+        "probed_at": "2026-11-16T12:00:00Z",
+    }
+
+    # CLEAN-01 (D-16): the base URL is redacted as a whole value and appears nowhere
+    assert diag["data"][CONF_LLM_BASE_URL] == "**REDACTED**"
+    assert "http://llm.test:4000/v1" not in str(diag)
+
     # Walk diagnostics asserting leaf types and structure
     _walk_diagnostics(diag)
+
+
+async def test_diagnostics_llm_probe_none_without_probe(
+    recorder_mock: Any,
+    hass: HomeAssistant,
+    energy_manager: EnergyManager,
+    std_prefs: dict[str, Any],
+) -> None:
+    """No probe: llm_probe is None and the base URL is still redacted (CLEAN-01).
+
+    The redaction assertion must not pass vacuously when no probe exists, so the
+    base URL carries userinfo and their secret must vanish from the dump.
+    """
+    energy_manager.data = std_prefs
+    async_set_power(hass, "sensor.grid_power", 500)
+    async_set_power(hass, "sensor.solar_power", 1200)
+    async_set_power(hass, "sensor.battery_power", -300)
+    async_set_power(hass, "sensor.washer_power", 200)
+
+    entry = await async_setup_via_flow(hass)
+    base_url = "http://user:secretpw@llm.test:4000/v1"
+
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            CONF_LLM_BASE_URL: base_url,
+            CONF_LLM_API_KEY: "sk-another-secret-key",
+            CONF_LLM_MODEL: "m1",
+        },
+    )
+
+    diag = await async_get_config_entry_diagnostics(hass, entry)
+    assert diag["llm_probe"] is None
+    assert diag["data"][CONF_LLM_BASE_URL] == "**REDACTED**"
+    text = str(diag)
+    assert base_url not in text
+    assert "secretpw" not in text
+    assert "sk-another-secret-key" not in text
+
+
+async def test_diagnostics_llm_probe_drops_unknown_keys(
+    recorder_mock: Any,
+    hass: HomeAssistant,
+    energy_manager: EnergyManager,
+    std_prefs: dict[str, Any],
+) -> None:
+    """An unexpected key in the stored probe is never copied into llm_probe (CLEAN-01)."""
+    energy_manager.data = std_prefs
+    async_set_power(hass, "sensor.grid_power", 500)
+    async_set_power(hass, "sensor.solar_power", 1200)
+    async_set_power(hass, "sensor.battery_power", -300)
+    async_set_power(hass, "sensor.washer_power", 200)
+
+    entry = await async_setup_via_flow(hass)
+
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            CONF_LLM_BASE_URL: "http://llm.test:4000/v1",
+            CONF_LLM_API_KEY: "sk-super-secret-key-12345",
+            CONF_LLM_MODEL: "m1",
+            CONF_LLM_PROBE: {
+                "strategy": "json_schema",
+                "token_param": "max_completion_tokens",
+                "send_temperature": False,
+                "model_returned": "m1-2026",
+                "model_mismatch": True,
+                "probed_at": "2026-11-16T12:00:00Z",
+                "raw_headers": {"authorization": "Bearer leak"},
+            },
+        },
+    )
+
+    diag = await async_get_config_entry_diagnostics(hass, entry)
+    assert set(diag["llm_probe"]) == {
+        "strategy",
+        "token_param",
+        "send_temperature",
+        "model_returned",
+        "model_mismatch",
+        "probed_at",
+    }
+    assert diag["llm_probe"]["model_mismatch"] is True
+    assert "raw_headers" not in diag["llm_probe"]
+    assert "Bearer leak" not in repr(diag["llm_probe"])
+    # WR-01: the raw probe must not survive anywhere in the dump -- the data
+    # section carries the same allow-listed copy, never the stored probe.
+    assert "raw_headers" not in repr(diag)
+    assert "Bearer leak" not in str(diag)
+    assert set(diag["data"][CONF_LLM_PROBE]) == set(diag["llm_probe"])
 

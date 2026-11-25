@@ -218,7 +218,9 @@ GitHub; expect code review and merges on GitLab.
 CI is GitLab (`.gitlab-ci.yml`), with two small GitHub Actions workflows on the public
 mirror. Pipelines run for merge requests, version tags (`x.y.z`), and web/scheduled
 triggers — nothing else. All jobs are interruptible except the two release jobs, so a
-newer pipeline on the same ref auto-cancels a superseded one.
+newer pipeline on the same ref auto-cancels a superseded one. The heavy validate jobs
+(`hassfest`, `musl-gate`, `pytest`, `export-dry-run`) are skipped on a version tag,
+where only `release-check` and `export-github` run.
 
 Stages: `review` → `validate` → `release`.
 
@@ -229,9 +231,12 @@ Stages: `review` → `validate` → `release`.
 | `musl-gate` | validate | `ci/musl_gate.sh` inside the HA 2026.11.1 container image: manifest requirements limited to numpy/scipy, real amd64 install under HA's constraint file, aarch64-musl dry-run resolve. |
 | `pytest` | validate | `python:3.14` image, `parallel: 4` shards via pytest-split (`ci/pytest.sh`), 20 min timeout per shard. Shard balance comes from the committed `ci/.test_durations`. |
 | `pytest-durations` | validate | Manual job that reruns the suite unsplit and uploads a fresh `ci/.test_durations` artifact. Run it after a large change in the suite's shape, then download and commit the file. |
-| `export-dry-run` | validate | `ci/export_github.sh dry-run` — builds and leak-scans the public tree on every pipeline, so a leak is caught on the branch, not at release time. |
+| `export-dry-run` | validate | `ci/export_github.sh dry-run` — builds and leak-scans the public tree on every non-tag pipeline, so a leak is caught on the branch, not at release time. |
 | `release-check` | validate | Tag pipelines only (`interruptible: false`). `ci/release_check.sh "$CI_COMMIT_TAG"` — the release gate. |
-| `export-github` | release | Tag pipelines only (`interruptible: false`), after all validate jobs. `ci/export_github.sh publish` pushes the public tree and tag to the GitHub mirror. |
+| `export-github` | release | Tag pipelines only (`interruptible: false`), after `release-check` (and, in a forced run, the other validate jobs). `ci/export_github.sh publish` pushes the public tree and tag to the GitHub mirror. |
+
+`hassfest`, `musl-gate`, `pytest` and `export-dry-run` are **skipped on version tags**
+(see Releasing below): the MR pipeline already ran them on the same tree.
 
 On the GitHub mirror, `.github/workflows/validate.yml` runs `hacs/action` and `hassfest`
 on pushes to `main`, PRs, a nightly schedule, and manual dispatch; `release.yml` runs on
@@ -244,9 +249,11 @@ Releasing is tag-driven and gated end to end; the full runbook (preconditions, t
 go-ahead gate, tag push, and GitHub-side confirmation) lives in
 [docs/releases/RELEASING.md](releases/RELEASING.md). In short: bump
 `custom_components/powerguesser/manifest.json`, add `docs/releases/<tag>.md`, land the
-change through a green-pipeline MR, then tag. The tag pipeline re-runs every validate
-job plus `release-check` before `export-github` publishes to the mirror, where the
-GitHub Release workflow takes over.
+change through a green-pipeline MR, then tag. The validate jobs are **skipped on the
+tag** — the MR pipeline already ran them on the same tree — so the tag pipeline is just
+`release-check` then `export-github`, which publishes to the mirror where the GitHub
+Release workflow takes over. A direct-commit release (no MR pipeline of its own) forces
+the validate jobs back on with `git push -o ci.variable="RELEASE_VALIDATE=1" origin <tag>`.
 
 ## Next steps
 

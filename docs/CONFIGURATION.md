@@ -75,6 +75,20 @@ Hitting a token or cost cap pauses learning and raises a `learning_capped` repai
 
 These options steps manage learned devices rather than settings: confirming/dismissing candidates, accepting parameter updates, rolling back device versions, merging devices, renaming, and starting/ending plug sessions (assigning a plug power sensor to a candidate or device to gather validation data). No persistent options are written here.
 
+Opening a candidate — or a confirmed device — shows an **evidence** block under its name, with run times in the Home Assistant time zone:
+
+- a summary line with the total run count and the observation span;
+- the newest 5 occurrences (date, start, duration, step W, Wh), then "…and N more";
+- a **Rhythm** line (typical time of day and typical gap), suppressed below 5 runs;
+- a **Profile** line (typical step W, duration, Wh per run, Wh per day, and the phase when phase channels exist) — any missing value prints `n/a`, never `0`;
+- **Hints** under an explicit heuristic label (few runs, wide step spread, short coverage).
+
+The hints describe the data behind the candidate; they are **heuristics, not an accuracy figure**, and no percentage is ever shown.
+
+The evidence block has four states. It is **"being computed"** in the background right after a restart or an upgrade from an earlier version — reopen Review in a few minutes. It becomes **ready** once the background `evidence` worker stage has run. After a run of failed refresh attempts it reads "**Evidence unavailable, will retry at the next learning run**". A confirmed device shows the same block, replayed from its **active learned parameters**, so it is directly comparable to the candidate it came from. Review is read-only: it never starts a learning or evidence job, and the background refresh sends nothing to the LLM endpoint.
+
+Plug sessions assign a plug power sensor to a candidate or device to gather validation data; a candidate-target plug reading is subtracted from the remainder while the session is active, a confirmed device's own sensors keep running. Sessions stay open until you end them or their end date passes.
+
 ## Required vs optional at a glance
 
 - **Required for learning to run**: an LLM endpoint (base URL + model), a granted consent for that endpoint origin, and at least 7 days of usable history (`MIN_LEARNING_DAYS`). A missing LLM endpoint surfaces as the `llm_auth` repairs issue, and a missing consent as the `learning_consent` repairs prompt; insufficient history creates no repairs issue — it only blocks the run with the `insufficient_data` reason.
@@ -100,4 +114,4 @@ Fixed (non-configurable) limits from `const.py` include: LLM request timeout 600
 
 ## Per-environment overrides
 
-None. Home Assistant config entries are per-instance: there is no dev/staging/production layering, no `.env` files, and no `NODE_ENV`-style switching. To replicate a setup on another Home Assistant instance, configure the same options in its UI; the stored LLM API key and consent records are per-instance and are never exported (diagnostics downloads redact secrets).
+None. Home Assistant config entries are per-instance: there is no dev/staging/production layering, no `.env` files, and no `NODE_ENV`-style switching. To replicate a setup on another Home Assistant instance, configure the same options in its UI; the stored LLM API key and consent records are per-instance and are never exported. A diagnostics download includes the latest LLM endpoint probe result, with the base URL and the API key **redacted**.
