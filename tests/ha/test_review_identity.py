@@ -2,20 +2,30 @@
 
 import json
 from typing import Any
+import numpy as np
 import pytest
 
 from homeassistant.components.energy.data import EnergyManager
 from homeassistant.core import HomeAssistant
 
 from custom_components.powerguesser.const import REVIEW_STORE_KEY
+from custom_components.powerguesser.engine.learning.artefact import (
+    Box,
+    SignatureArtefact,
+    State,
+)
+from custom_components.powerguesser.engine.learning.identity import match_identities
 from tests.conftest import (
+    async_confirm_candidate,
     async_fill_synth_buffer,
     async_open_options_step,
     async_seed_consent,
     async_seed_llm,
     async_set_power,
     async_setup_via_flow,
+    make_switched_candidate,
     mock_llm,
+    seed_candidates,
     switched_cluster_ids,
 )
 from tests.fixtures.learning.fake_llm import chat_completion
@@ -555,3 +565,218 @@ async def test_learning_runs_never_modify_review_store(
     # Review store in storage is unchanged
     actual_decisions = hass_storage[REVIEW_STORE_KEY]["data"]["decisions"]
     assert actual_decisions == expected_decisions
+
+
+# --- D-01: pre-upgrade candidates (stored without a "fingerprint") get a real one ---
+
+
+async def _setup_seeded(
+    hass: HomeAssistant,
+    energy_manager: EnergyManager,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> Any:
+    """Set up PowerGuesser with the given candidates seeded and the standard powers."""
+    seed_candidates(hass_storage, candidates)
+    energy_manager.data = std_prefs
+    _set_std_powers(hass)
+    return await async_setup_via_flow(hass)
+
+
+def _pre_upgrade(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return the candidate without its stored "fingerprint" key (a pre-upgrade record)."""
+    pre = dict(candidate)
+    pre.pop("fingerprint", None)
+    return pre
+
+
+async def _open_candidate(hass: HomeAssistant, entry: Any, sig_id: str) -> dict[str, Any]:
+    """Open the Review options flow and pick the given candidate."""
+    res_review = await async_open_options_step(hass, entry, "review")
+    return await hass.config_entries.options.async_configure(
+        res_review["flow_id"], {"candidate": sig_id}
+    )
+
+
+async def _dismiss(hass: HomeAssistant, entry: Any, sig_id: str) -> None:
+    """Dismiss a candidate through the Review options flow."""
+    res_cand = await _open_candidate(hass, entry, sig_id)
+    await hass.config_entries.options.async_configure(
+        res_cand["flow_id"], {"next_step_id": "dismiss"}
+    )
+
+
+async def test_dismiss_pre_upgrade_candidate_records_computed_fingerprint(
+    recorder_mock: Any,
+    hass: HomeAssistant,
+    energy_manager: EnergyManager,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+) -> None:
+    """D-01 HA fallback: dismissing a candidate stored without a "fingerprint" records the computed one."""
+    candidate = _pre_upgrade(make_switched_candidate("sig-kettle", "Kettle", rise_w=2000.0))
+    entry = await _setup_seeded(hass, energy_manager, std_prefs, hass_storage, [candidate])
+    sup = entry.runtime_data.learning
+
+    await _dismiss(hass, entry, "sig-kettle")
+
+    decision = sup.review.decisions["sig-kettle"]
+    assert decision["status"] == "dismissed"
+    assert decision["fingerprint"] == SignatureArtefact.from_dict(candidate).fingerprint()
+    assert decision["fingerprint"]["states"]
+
+
+async def test_rename_and_merge_pre_upgrade_candidates_record_fingerprints(
+    recorder_mock: Any,
+    hass: HomeAssistant,
+    energy_manager: EnergyManager,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+) -> None:
+    """D-01 HA fallback: renaming one and merging another pre-upgrade candidate records both fingerprints."""
+    target = _pre_upgrade(make_switched_candidate("sig-a", "A", rise_w=2000.0))
+    source = _pre_upgrade(make_switched_candidate("sig-b", "B", rise_w=1800.0))
+    entry = await _setup_seeded(
+        hass, energy_manager, std_prefs, hass_storage, [target, source]
+    )
+    sup = entry.runtime_data.learning
+
+    # Rename the target.
+    res_cand = await _open_candidate(hass, entry, "sig-a")
+    res_rename = await hass.config_entries.options.async_configure(
+        res_cand["flow_id"], {"next_step_id": "rename"}
+    )
+    await hass.config_entries.options.async_configure(
+        res_rename["flow_id"], {"name": "Kettle A"}
+    )
+
+    # Merge the source into the target.
+    res_cand = await _open_candidate(hass, entry, "sig-a")
+    res_merge = await hass.config_entries.options.async_configure(
+        res_cand["flow_id"], {"next_step_id": "merge"}
+    )
+    await hass.config_entries.options.async_configure(
+        res_merge["flow_id"], {"sources": ["sig-b"]}
+    )
+
+    decisions = sup.review.decisions
+    assert decisions["sig-a"]["fingerprint"] == SignatureArtefact.from_dict(target).fingerprint()
+    assert decisions["sig-b"]["status"] == "merged"
+    assert decisions["sig-b"]["fingerprint"] == SignatureArtefact.from_dict(source).fingerprint()
+    assert decisions["sig-b"]["fingerprint"]["states"]
+
+
+async def test_confirm_pre_upgrade_candidate_links_fingerprint(
+    recorder_mock: Any,
+    hass: HomeAssistant,
+    energy_manager: EnergyManager,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+) -> None:
+    """D-01 HA fallback: confirming a candidate stored without a "fingerprint" writes the computed one on the device link."""
+    candidate = _pre_upgrade(make_switched_candidate("sig-kettle", "Kettle", rise_w=2000.0))
+    entry = await _setup_seeded(hass, energy_manager, std_prefs, hass_storage, [candidate])
+    sup = entry.runtime_data.learning
+
+    await async_confirm_candidate(hass, entry, "sig-kettle", "Kettle")
+
+    decision = sup.review.decisions["sig-kettle"]
+    assert decision["device_uuid"]
+    assert decision["fingerprint"] == SignatureArtefact.from_dict(candidate).fingerprint()
+    assert decision["fingerprint"]["states"]
+
+
+# The near-twin fixtures mirror tests/engine/learning/test_identity.py's D-19 shapes:
+# a switched episode table with dur_s = (i + 1) * 10 and range artefacts whose dur
+# boxes select episodes a..b, so a dismissed shape's twin-suppression is exercised
+# against real replay claims.
+
+
+def _dur_table(n: int) -> dict[str, Any]:
+    """Table of n switched episodes; episode i has dur_s = (i + 1) * 10."""
+    return {
+        "start_i": np.arange(n, dtype=np.int64),
+        "end_i": np.arange(n, dtype=np.int64) + 1,
+        "rise_w": np.full(n, 2000.0),
+        "fall_w": np.full(n, -2000.0),
+        "dur_s": np.array([(i + 1) * 10 for i in range(n)], dtype=np.float64),
+        "plateau_w": np.full(n, 2000.0),
+        "energy_wh": np.full(n, 50.0),
+        "kind": np.zeros(n, dtype=np.int32),
+        "block": np.zeros(n, dtype=np.int32),
+    }
+
+
+def _range_state(a: int, b: int, name: str) -> dict[str, Any]:
+    """A candidate state whose dur box selects episodes a..b of _dur_table."""
+    return {
+        "name": name,
+        "rise_w": {"lo": 1500.0, "p50": 2000.0, "hi": 2500.0},
+        "fall_w": {"lo": -2500.0, "p50": -2000.0, "hi": -1500.0},
+        "dur_s": {
+            "lo": float((a + 1) * 10 - 5),
+            "p50": float(((a + b) // 2 + 1) * 10),
+            "hi": float((b + 1) * 10 + 5),
+        },
+        "plateau_w": {"lo": 1500.0, "p50": 2000.0, "hi": 2500.0},
+        "phase_share": None,
+    }
+
+
+def _range_artefact(sig_id: str, a: int, b: int) -> SignatureArtefact:
+    """Switched artefact claiming exactly episodes a..b of _dur_table."""
+    state = State(
+        name="on",
+        rise_w=Box(lo=1900.0, p50=2000.0, hi=2100.0),
+        fall_w=Box(lo=-2100.0, p50=-2000.0, hi=-1900.0),
+        dur_s=Box(
+            lo=float((a + 1) * 10 - 5),
+            p50=float(((a + b) // 2 + 1) * 10),
+            hi=float((b + 1) * 10 + 5),
+        ),
+        plateau_w=Box(lo=1900.0, p50=2000.0, hi=2100.0),
+        phase_share=None,
+    )
+    return SignatureArtefact(
+        schema_version=1,
+        signature_id=sig_id,
+        kind="switched",
+        label=sig_id,
+        category="unknown",
+        extraction={"grid_s": 30, "edge_threshold_w": 120, "merge_samples": 2, "pair_tol": 0.25},
+        states=(state,),
+        session=None,
+        time_prior={"hour": [1 / 24] * 24, "dow": [1 / 7] * 7},
+        constraints={"max_concurrent": 1},
+        provenance={},
+        scores={},
+    )
+
+
+async def test_dismissed_shape_suppresses_twin_after_leaving_candidates(
+    recorder_mock: Any,
+    hass: HomeAssistant,
+    energy_manager: EnergyManager,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+) -> None:
+    """D-01: a dismissed pre-upgrade candidate's computed fingerprint is a real prior, so its
+    near twin is suppressed (with twin_of set) after the candidate left the candidate list.
+    """
+    prior = _pre_upgrade(make_switched_candidate("sig-prior", "Prior"))
+    prior["states"] = [_range_state(0, 9, "a"), _range_state(20, 49, "b")]
+    entry = await _setup_seeded(hass, energy_manager, std_prefs, hass_storage, [prior])
+    sup = entry.runtime_data.learning
+
+    await _dismiss(hass, entry, "sig-prior")
+    decisions = sup.review.decisions
+    assert decisions["sig-prior"]["status"] == "dismissed"
+
+    # No prior candidates: the dismissed shape alone must suppress the twin.
+    table = _dur_table(50)
+    twin = _range_artefact("new1", 0, 9)
+    res = match_identities([twin], [], decisions, table)
+    ident = res[0]["identity"]
+    assert ident["status"] == "suppressed"
+    assert ident["twin_of"] == "sig-prior"

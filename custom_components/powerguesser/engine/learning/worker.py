@@ -51,6 +51,8 @@ from .split import (
 )
 from ..detect.online import compile_model
 from ..detect.replay import replay_online, validation_error_pct
+from ..capture.constants import ANCHOR_TOL_STEPS, HOLDOUT_PAD_STEPS
+from ..capture.exclusion import holdout_exclusion_mask
 from ..validation import overlap as overlap_metrics
 from ..validation.constants import (
     LINK_MIN_OVERLAP,
@@ -746,9 +748,73 @@ def compile_score(job: Mapping) -> dict:
 
     prior = job.get("prior", [])
     decisions = job.get("decisions", {})
+    # CAP-09 (Plan 08-08): map each capture anchor to the episode rows its
+    # snapped rise/fall lies within ANCHOR_TOL_STEPS grid steps of. An anchor
+    # that maps to no row is dropped and named in the output (learning.py logs
+    # it at debug, since the engine has no logging). Without the key the call
+    # is byte-identical to before and the output carries no anchors_unmapped.
+    capture_anchors_raw = job.get("capture_anchors") or []
+    anchors: dict[str, set[int]] = {}
+    anchors_unmapped: list[str] = []
+    if capture_anchors_raw:
+        if residual_path.is_file():
+            with np.load(str(residual_path), allow_pickle=False) as anchor_data:
+                anchor_start_ms = int(anchor_data["start_ms"][0])
+                anchor_step_ms = int(anchor_data["step_ms"][0])
+            tol_ms = ANCHOR_TOL_STEPS * anchor_step_ms
+            ep_start_ms = anchor_start_ms + episodes["start_i"] * anchor_step_ms
+            ep_end_ms = anchor_start_ms + episodes["end_i"] * anchor_step_ms
+            ep_kind = episodes["kind"]
+            unmapped: list[str] = []
+            for anchor in capture_anchors_raw:
+                sig = str(anchor.get("signature_id", ""))
+                if not sig:
+                    continue
+                try:
+                    rise_ms = float(anchor["rise_ms"])
+                    fall_ms = float(anchor["fall_ms"])
+                except (KeyError, TypeError, ValueError):
+                    unmapped.append(sig)
+                    continue
+                mask = (
+                    (ep_kind == 0)
+                    & (np.abs(ep_start_ms - rise_ms) <= tol_ms)
+                    & (np.abs(ep_end_ms - fall_ms) <= tol_ms)
+                )
+                rows = {int(r) for r in np.where(mask)[0]}
+                if rows:
+                    # Several captures can share one signature_id: union their
+                    # rows rather than overwriting, so every captured episode of
+                    # the group anchors the identity (not just the last record's).
+                    anchors.setdefault(sig, set()).update(rows)
+                else:
+                    unmapped.append(sig)
+            # A signature that also has a mapping anchor is not unmapped; only a
+            # group with no mapped rows at all is named (logging only).
+            anchors_unmapped = [sig for sig in unmapped if sig not in anchors]
+        else:
+            anchors_unmapped = [
+                str(a["signature_id"])
+                for a in capture_anchors_raw
+                if a.get("signature_id")
+            ]
     matched_dicts = match_identities(
-        updated_artefacts, prior, decisions, episodes, owned=job.get("owned", [])
+        updated_artefacts,
+        prior,
+        decisions,
+        episodes,
+        owned=job.get("owned", []),
+        anchors=anchors,
+        capture_prior_ids=job.get("capture_prior_ids") or (),
     )
+
+    # Phase 8 D-01: stamp every learned candidate with its structural fingerprint,
+    # unconditionally (no job flag) — the shadow library included — so a dismissed
+    # shape stays a real prior for identity matching on later runs. Put this before
+    # the D-17 gate block: SignatureArtefact.from_dict reads only its named keys, so
+    # the extra "fingerprint" key reaches validate's measurable_artefacts harmlessly.
+    for matched in matched_dicts:
+        matched["fingerprint"] = SignatureArtefact.from_dict(matched).fingerprint()
 
     # D-17 (Plan 05-06): the proposal gate. The HA side passes the frozen
     # active artefact of every confirmed device under its signature id (the
@@ -840,7 +906,7 @@ def compile_score(job: Mapping) -> dict:
     lib_path = stage_dir / f"library_{round_no}.json"
     _write_atomic(lib_path, canonical_json(matched_dicts))
 
-    return {
+    out = {
         "stage_dir": str(stage_dir),
         "library": str(lib_path),
         "scorecard": str(scorecard_path),
@@ -851,6 +917,11 @@ def compile_score(job: Mapping) -> dict:
         "n_artefacts": len(matched_dicts),
         "unresolved": unresolved,
     }
+    # Only a job that carried capture_anchors gains the key, so the Plan 04-13
+    # golden and the shadow job (no anchors) keep their exact output shape.
+    if capture_anchors_raw:
+        out["anchors_unmapped"] = sorted(set(anchors_unmapped))
+    return out
 
 
 def rescore(job: Mapping) -> dict:
@@ -1775,6 +1846,31 @@ def validate(job: Mapping) -> dict:
         holdout_mask = np.zeros(len(r), dtype=bool)
         r_masked = np.full_like(r, np.nan)
 
+    # D-05 (Plan 08-04): each capture window's padded span is dropped from the
+    # METRIC mask only -- r_masked stays exactly as built so the replay keeps its
+    # continuity (RESEARCH Pitfall 5). ``windows`` counts the capture windows
+    # whose padded span overlaps the holdout (computed through the same helper,
+    # never by re-deriving bounds inline); ``samples`` counts the holdout samples
+    # removed. The whole block is a no-op without a non-empty capture_windows key,
+    # so the report stays byte-identical.
+    cap_mask: np.ndarray | None = None
+    excluded_capture: dict[str, int] | None = None
+    capture_windows = job.get("capture_windows") or []
+    if capture_windows:
+        grid_ts = start_ms + np.arange(len(r), dtype=np.int64) * step_ms
+        pad_ms = HOLDOUT_PAD_STEPS * step_ms
+        cap_mask = holdout_exclusion_mask(grid_ts, capture_windows, pad_ms)
+        overlapping = sum(
+            1
+            for window in capture_windows
+            if bool(
+                np.any(holdout_mask & holdout_exclusion_mask(grid_ts, [window], pad_ms))
+            )
+        )
+        samples_removed = int(np.sum(holdout_mask & cap_mask))
+        holdout_mask = holdout_mask & ~cap_mask
+        excluded_capture = {"windows": int(overlapping), "samples": samples_removed}
+
     days_report = []
     for d in holdout_idx:
         m = sample_day == d
@@ -1864,6 +1960,10 @@ def validate(job: Mapping) -> dict:
         if start_rows is not None and len(start_rows):
             idx = np.asarray(start_rows, dtype=np.int64)
             idx = idx[(idx >= 0) & (idx < len(sample_day))]
+            if cap_mask is not None:
+                # D-05: a plug event whose start sample lies in a capture window
+                # is a taught example and leaves n_events / per_day.
+                idx = idx[~cap_mask[idx]]
             day_of_event = sample_day[idx]
         n_events = int(np.sum(np.isin(day_of_event, list(holdout_set)))) if len(day_of_event) else 0
 
@@ -1978,6 +2078,7 @@ def validate(job: Mapping) -> dict:
         shadow_stale=shadow_stale,
         overlap=overlap_report,
         overlap_synthetic=overlap_synthetic,
+        excluded_capture=excluded_capture,
     )
     _write_atomic(report_path, canonical_json(report))
     return report
@@ -2074,6 +2175,17 @@ def validate_sessions(job: Mapping) -> dict:
     phases = series.phases if series.phases else None
     suppress_flag = "short_event" not in enabled_event_types
 
+    # D-05 (Plan 08-04): capture windows are dropped from each session's holdout
+    # METRIC mask (the session holdout is a holdout window). No output key: the
+    # sessions.json shape is unchanged; only the main report carries
+    # holdout.excluded_capture. The residual replay is untouched (Pitfall 5).
+    capture_windows = job.get("capture_windows") or []
+    cap_mask: np.ndarray | None = None
+    if capture_windows:
+        cap_mask = holdout_exclusion_mask(
+            grid_ts, capture_windows, HOLDOUT_PAD_STEPS * step_ms
+        )
+
     # Compile the competitors once. A failing one is dropped from every replay
     # and named in each session entry's skipped_competitors (review L233).
     valid_others: list[Mapping] = []
@@ -2150,6 +2262,13 @@ def validate_sessions(job: Mapping) -> dict:
             continue
 
         holdout_mask = np.isin(sample_day, list(holdout_set))
+        # D-05: the capture windows drop samples from the holdout METRIC mask
+        # only. The replay input keeps the pre-exclusion mask (r_session_mask) so
+        # capture windows are never NaN holes in the replay (Pitfall 5) — exactly
+        # as the main ``validate`` path keeps its pre-exclusion replay residual.
+        r_session_mask = holdout_mask
+        if cap_mask is not None:
+            holdout_mask = holdout_mask & ~cap_mask
         baseline_mask = np.isin(sample_day, baseline_days)
         mean_w = (
             float(np.nanmean(plug_w[baseline_mask]))
@@ -2160,7 +2279,7 @@ def validate_sessions(job: Mapping) -> dict:
         pool = list(valid_others)
         if own_sig not in other_sigs:
             pool = [*pool, artefact]
-        r_session = np.where(holdout_mask, residual_w, np.nan)
+        r_session = np.where(r_session_mask, residual_w, np.nan)
         online = replay_online(
             pool,
             r_session,
@@ -2188,6 +2307,10 @@ def validate_sessions(job: Mapping) -> dict:
         if start_rows is not None and len(start_rows):
             idx = np.asarray(start_rows, dtype=np.int64)
             idx = idx[(idx >= 0) & (idx < len(sample_day))]
+            if cap_mask is not None:
+                # D-05: a session plug event starting in a capture window is not
+                # counted (no output key; the sessions.json shape is unchanged).
+                idx = idx[~cap_mask[idx]]
             day_of_event = sample_day[idx]
         n_events = (
             int(np.sum(np.isin(day_of_event, list(holdout_set))))

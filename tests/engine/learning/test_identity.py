@@ -10,6 +10,7 @@ from custom_components.powerguesser.engine.learning.identity import (
     BOX_IOU_MIN,
     JACCARD_MIN,
     match_identities,
+    similar_dismissed,
 )
 
 
@@ -662,4 +663,307 @@ def test_to_artefact_restores_session_stages_from_a_fingerprint() -> None:
     switched_fp = {"kind": "program", "states": prog.fingerprint()["states"]}
     bare = _to_artefact({"kind": "program", "fingerprint": switched_fp})
     assert _calc_artefact_box_iou(prog, bare) == 0.0
+
+
+# --- D-07 (HA half): similar_dismissed -------------------------------------
+
+
+def test_similar_dismissed_picks_best_overlap() -> None:
+    """The best overlapping dismissed fingerprint wins; named/low/other-kind/missing are ignored."""
+    from custom_components.powerguesser.engine.learning.identity import (
+        _calc_artefact_box_iou,
+        _to_artefact,
+    )
+
+    base = _make_test_artefact("new", "New", 1900, 2000, 2100, 90, 120, 150)
+    hi = _make_test_artefact("dhi", "Dhi", 1900, 2000, 2100, 90, 120, 160).fingerprint()
+    lo = _make_test_artefact("dlo", "Dlo", 1900, 2000, 2100, 90, 120, 220).fingerprint()
+    named = _make_test_artefact("dname", "Named", 1900, 2000, 2100, 90, 120, 150).fingerprint()
+    decisions: dict[str, Any] = {
+        "dhi": {"status": "dismissed", "fingerprint": hi},
+        "dlo": {"status": "dismissed", "fingerprint": lo},
+        "dname": {"status": "named", "fingerprint": named},
+    }
+
+    iou_hi = _calc_artefact_box_iou(base, _to_artefact(decisions["dhi"], "dhi"))
+    iou_lo = _calc_artefact_box_iou(base, _to_artefact(decisions["dlo"], "dlo"))
+    iou_named = _calc_artefact_box_iou(base, _to_artefact(decisions["dname"], "dname"))
+    assert iou_named > iou_hi > iou_lo >= BOX_IOU_MIN
+
+    # The named decision has the best overlap but is not dismissed: dhi wins.
+    assert similar_dismissed(base.to_dict(), decisions) == "dhi"
+
+    # A dismissed fingerprint below BOX_IOU_MIN is ignored.
+    far = _make_test_artefact("dfar", "Dfar", 100, 200, 300, 10, 20, 30).fingerprint()
+    assert similar_dismissed(base, {"dfar": {"status": "dismissed", "fingerprint": far}}) is None
+
+    # Another kind never matches.
+    prog = {
+        "status": "dismissed",
+        "fingerprint": {"kind": "program", "states": base.fingerprint()["states"]},
+    }
+    assert similar_dismissed(base, {"prog": prog}) is None
+
+    # A decision without a fingerprint is ignored.
+    assert similar_dismissed(base, {"nofp": {"status": "dismissed"}}) is None
+    assert similar_dismissed(base, {}) is None
+
+
+# --- CAP-09 (Plan 08-08): containment anchors and capture-origin precedence ---
+
+
+def _table_with_blocks(rows: list[tuple[float, int]]) -> dict[str, np.ndarray]:
+    """Switched episodes with the given (dur_s, block); rise/fall/plateau 2000 W."""
+    n = len(rows)
+    return {
+        "start_i": np.arange(n, dtype=np.int64),
+        "end_i": np.arange(n, dtype=np.int64) + 1,
+        "rise_w": np.full(n, 2000.0),
+        "fall_w": np.full(n, -2000.0),
+        "dur_s": np.array([float(d) for d, _b in rows], dtype=np.float64),
+        "plateau_w": np.full(n, 2000.0),
+        "energy_wh": np.full(n, 50.0),
+        "kind": np.zeros(n, dtype=np.int32),
+        "block": np.array([b for _d, b in rows], dtype=np.int32),
+    }
+
+
+def _anchor_fixture() -> tuple[
+    dict[str, np.ndarray], SignatureArtefact, SignatureArtefact, dict[str, set[int]]
+]:
+    """A val-block capture whose preview over-claims the train rows.
+
+    Ten train episodes (dur 10..100, block 0) plus one validation episode
+    (dur 150, block 1): the captured kettle run. The LLM artefact's narrow box
+    claims only the train row at dur 100 and the val row; the preview's wide
+    tolerance box claims all ten train rows, so Jaccard on train claims is
+    1/10 < 0.5 and the one-to-one pass cannot match them. The anchor maps the
+    preview id to the val row (index 10).
+    """
+    rows = [(float((i + 1) * 10), 0) for i in range(10)] + [(150.0, 1)]
+    table = _table_with_blocks(rows)
+    new_art = _make_test_artefact("llm", "Llm", 1900, 2000, 2100, 95, 120, 210)
+    preview = _make_test_artefact("cap_preview", "Kettle", 1900, 2000, 2100, 5, 55, 355)
+    return table, new_art, preview, {"cap_preview": {10}}
+
+
+def test_anchor_matches_capture_in_val_block() -> None:
+    """CAP-09: a val-block capture reconciles the learned artefact to the preview.
+
+    The preview's wide boxes over-claim the train rows (Jaccard < 0.5), so the
+    one-to-one pass gives up; the containment-anchor pass matches because the
+    learned artefact itself claims the captured val episode. Without the anchor
+    there are two identities.
+    """
+    table, new_art, preview, anchors = _anchor_fixture()
+
+    res = match_identities([new_art], [preview], {}, table, anchors=anchors)
+    assert res[0]["signature_id"] == "cap_preview"
+    assert res[0]["identity"]["status"] == "matched"
+    assert res[0]["identity"]["matched"] == "cap_preview"
+
+    res_no = match_identities([new_art], [preview], {}, table)
+    assert res_no[0]["signature_id"] == "llm"
+    assert res_no[0]["identity"]["status"] == "new"
+
+
+def test_anchor_ties_and_kind() -> None:
+    """CAP-09: the artefact containing more anchors wins, ties by new id ascending;
+    a program artefact never anchor-matches a switched preview."""
+    rows = [(float((i + 1) * 10), 0) for i in range(4)] + [(150.0, 1), (160.0, 1)]
+    table = _table_with_blocks(rows)
+    preview = _make_test_artefact("cap_preview", "Kettle", 1900, 2000, 2100, 5, 55, 355)
+    anchors = {"cap_preview": {4, 5}}
+
+    # new_a claims both anchored val rows; new_b only one -> new_a wins.
+    new_a = _make_test_artefact("new_a", "A", 1900, 2000, 2100, 95, 120, 210)
+    new_b = _make_test_artefact("new_b", "B", 1900, 2000, 2100, 145, 150, 155)
+    res = match_identities([new_a, new_b], [preview], {}, table, anchors=anchors)
+    assert res[0]["signature_id"] == "cap_preview"
+    assert res[0]["identity"]["status"] == "matched"
+    assert res[1]["signature_id"] == "new_b"
+    assert res[1]["identity"]["status"] == "new"
+
+    # Tie at one anchored row: the lower new id wins (new_c < new_d).
+    new_c = _make_test_artefact("new_c", "C", 1900, 2000, 2100, 145, 150, 155)
+    new_d = _make_test_artefact("new_d", "D", 1900, 2000, 2100, 135, 150, 165)
+    res_tie = match_identities(
+        [new_c, new_d], [preview], {}, table, anchors={"cap_preview": {4}}
+    )
+    assert res_tie[0]["signature_id"] == "cap_preview"
+    assert res_tie[1]["signature_id"] == "new_d"
+    assert res_tie[1]["identity"]["status"] == "new"
+
+    # A program artefact never anchor-matches a switched preview.
+    prog = _make_test_artefact("new_prog", "P", 1900, 2000, 2100, 145, 150, 155, kind="program")
+    res_prog = match_identities(
+        [prog], [preview], {}, table, anchors={"cap_preview": {4}}
+    )
+    assert res_prog[0]["identity"]["status"] == "new"
+
+
+def test_capture_prior_beats_dismissed_twin() -> None:
+    """D-07: capture-origin precedence matches the capture prior before a higher-
+    scoring dismissed twin, so the artefact reconciles instead of being suppressed."""
+    table = _dur_table(20)
+    new_art = _range_artefact("new1", 0, 9)  # claims {0..9}
+    capture = _range_artefact("cap_prior", 0, 5)  # Jaccard 6/10 = 0.6
+    decisions = {"priorD": _decision_for_ranges([(0, 7)])}  # Jaccard 8/10 = 0.8
+
+    res = match_identities(
+        [new_art], [capture], decisions, table, capture_prior_ids=["cap_prior"]
+    )
+    assert res[0]["signature_id"] == "cap_prior"
+    assert res[0]["identity"]["status"] == "matched"
+    assert res[0]["identity"]["twin_of"] is None
+
+
+def test_llm_twin_of_dismissed_still_suppressed() -> None:
+    """D-07 regression: without a capture prior an LLM near twin of a dismissed
+    candidate stays suppressed, and the new keywords change nothing."""
+    table = _dur_table(50)
+    new_art = _range_artefact("new1", 0, 9)
+    decisions = {"priorD": _decision_for_ranges([(0, 9), (20, 49)])}
+
+    res = match_identities(
+        [new_art], [], decisions, table, anchors=None, capture_prior_ids=()
+    )
+    res_plain = match_identities([new_art], [], decisions, table)
+    assert res == res_plain
+    ident = res[0]["identity"]
+    assert ident["status"] == "suppressed"
+    assert ident["matched"] is None
+    assert ident["twin_of"] == "priorD"
+
+
+def test_no_capture_keywords_is_identical() -> None:
+    """Without the capture keywords, match_identities output is byte-identical
+    to the pre-CAP-09 call for every existing fixture shape in this file."""
+    scenarios: list[tuple] = []
+
+    # identity_ignores_llm_names
+    t1 = _make_test_table(
+        [
+            {"rise_w": 2000.0, "fall_w": -2000.0, "dur_s": 120.0},
+            {"rise_w": 1500.0, "fall_w": -1500.0, "dur_s": 600.0},
+        ]
+    )
+    scenarios.append(
+        (
+            [_make_test_artefact("new1", "N", 1900, 2000, 2100, 90, 120, 150)],
+            [_make_test_artefact("prior1", "P", 1900, 2000, 2100, 90, 120, 150)],
+            {},
+            t1,
+            (),
+        )
+    )
+
+    # suppression + merge mapping
+    n1 = _make_test_artefact("new1", "A1", 1900, 2000, 2100, 90, 120, 150)
+    n2 = _make_test_artefact("new2", "A2", 1400, 1500, 1600, 500, 600, 700)
+    p1 = _make_test_artefact("prior1", "P1", 1900, 2000, 2100, 90, 120, 150)
+    p2 = _make_test_artefact("prior2", "P2", 1400, 1500, 1600, 500, 600, 700)
+    scenarios.append(
+        (
+            [n1, n2],
+            [p1, p2],
+            {
+                "prior1": {"status": "dismissed", "name": None, "merged_into": None},
+                "prior2": {"status": "merged", "name": None, "merged_into": "t99"},
+            },
+            t1,
+            (),
+        )
+    )
+
+    # near twin of dismissed
+    t2 = _dur_table(50)
+    scenarios.append(
+        (
+            [_range_artefact("new1", 0, 9)],
+            [],
+            {"priorD": _decision_for_ranges([(0, 9), (20, 49)])},
+            t2,
+            (),
+        )
+    )
+
+    # owned twin suppression
+    t3 = _dur_table(20)
+    scenarios.append(
+        (
+            [_range_artefact("newM", 0, 19), _range_artefact("newN", 0, 11)],
+            [_range_artefact("ownedO", 0, 19)],
+            {},
+            t3,
+            ("ownedO",),
+        )
+    )
+
+    # box-IoU fallback
+    t4 = _make_test_table([{"rise_w": 500.0, "fall_w": -500.0, "dur_s": 30.0}])
+    scenarios.append(
+        (
+            [_make_test_artefact("new_iou", "N", 1900, 2000, 2100, 80, 100, 120)],
+            [_make_test_artefact("prior_iou", "P", 1920, 2000, 2080, 85, 100, 115)],
+            {},
+            t4,
+            (),
+        )
+    )
+
+    for new, priors, decisions, table, owned in scenarios:
+        base = match_identities(new, priors, decisions, table, owned=owned)
+        same = match_identities(
+            new,
+            priors,
+            decisions,
+            table,
+            owned=owned,
+            anchors=None,
+            capture_prior_ids=(),
+        )
+        assert same == base
+
+
+def test_anchor_claims_do_not_depend_on_priors() -> None:
+    """The anchor pass's solo replay of blocks 1 and 2 is exact, and a competing
+    non-capture prior that also contains the anchored row does not block the match."""
+    from custom_components.powerguesser.engine.learning.score import replay
+
+    table, new_art, preview, anchors = _anchor_fixture()
+
+    for block in (1, 2):
+        solo = replay([new_art], table, block=block).claims["llm"]
+        joint = replay([new_art, preview], table, block=block).claims["llm"]
+        assert solo == joint
+
+    # A second, non-capture prior Q whose boxes also contain the anchored row
+    # (and whose train claims do not match the new artefact) is not the anchor
+    # target: the capture prior still wins.
+    q = _make_test_artefact("q_prior", "Q", 1900, 2000, 2100, 5, 55, 355)
+    res = match_identities(
+        [new_art],
+        [q, preview],
+        {},
+        table,
+        anchors=anchors,
+        capture_prior_ids=["cap_preview"],
+    )
+    assert res[0]["signature_id"] == "cap_preview"
+    assert res[0]["identity"]["status"] == "matched"
+
+
+def test_anchor_pass_without_block_two() -> None:
+    """A table with blocks 0 and 1 only still runs the anchor pass (the block-2
+    replay contributes empty claims) and still anchor-matches the val capture."""
+    from custom_components.powerguesser.engine.learning.score import replay
+
+    table, new_art, preview, anchors = _anchor_fixture()
+    assert sorted(set(table["block"].tolist())) == [0, 1]
+    assert replay([new_art], table, block=2).claims["llm"] == set()
+
+    res = match_identities([new_art], [preview], {}, table, anchors=anchors)
+    assert res[0]["signature_id"] == "cap_preview"
+    assert res[0]["identity"]["status"] == "matched"
 

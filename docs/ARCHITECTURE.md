@@ -138,6 +138,65 @@ resulting report feeds `DeviceValidationSensor` and the accuracy table. A live d
 sessions are tracked as extra buffer channels (`KIND_SESSION`) and, for candidate targets,
 subtracted live from the remainder exactly once (hub.py).
 
+### 5. Guided capture (admin actions)
+
+The guided-capture admin actions teach PowerGuesser one real device run without waiting for a
+learning pass. Captures stay local: nothing here reaches the LLM endpoint (captures join the
+learning payload only in a later version). `CaptureManager` (`capture.py`) owns its own
+`powerguesser.captures` Store and drives the flow. The seven admin services are:
+
+- `powerguesser.capture_window` — snap a past local start/end window to the real rise/fall
+  pair. `window.resolve_window` (engine/capture/window.py) validates the window (outside the
+  buffer, across a gap, too short for the sample rate, too long, a future end, and ambiguous
+  or non-existent local times in the Home Assistant time zone), then `snap.snap_run`
+  (engine/capture/snap.py) rebuilds the learner's own residual over the window through the
+  shared `_load_job_residual` and reuses `detect_edges` → `suppress_alignment_artefacts` →
+  `pair_switched`, so a captured episode equals the extract row. The result carries edge
+  times, step W, duration, Wh, a quality verdict (`clean` / `contaminated` / `ambiguous` /
+  `none`) and the attachment; only a `clean` capture teaches.
+- `powerguesser.capture_start` — start a live "on now" capture; a second start is refused
+  while one is open.
+- `powerguesser.capture_stop` — stop the open live capture and return at once with state
+  `resolving`; the manager owns the settle wait and the max-open expiry timers and ends an
+  open capture as `interrupted` on a restart (D-08).
+- `powerguesser.capture_cancel` — cancel an open capture; idempotent on a finished one.
+- `powerguesser.capture_list` — read every stored capture (or the one named by `capture_id`)
+  with its result block, the interpreted window and its read-time resolved target.
+- `powerguesser.capture_delete` — remove a stored capture and report whether its preview card
+  was removed.
+- `powerguesser.capture_reassign` — re-target a capture to a new device, a candidate or a
+  confirmed device; the only action that rewrites a target.
+
+A capture aimed at a new device or an existing `cap_` preview appears in Review at once as a
+**preview candidate** derived at read time (`CaptureManager.preview_candidates`) from its clean
+records, never stored — so delete, reassign, merge and dismiss can never leave a stale preview
+(D-06). A capture aimed at a learned candidate or a confirmed device is stored and reported but
+attaches as an example only (no new preview card). Confirming a preview is gated on
+`CONFIRM_MIN_RUNS` clean runs (`CaptureManager`/`review_actions` raise `preview_needs_runs`), and
+the gate never blocks reconciliation.
+
+The next learning run reconciles the preview with the LLM's candidate. On the HA side
+`learning._async_run` feeds the capture context into the local compile job (never a prompt):
+`captures.identity_priors()` (the preview artefact dicts), `captures.capture_prior_ids()` (their
+ids) and `captures.capture_anchors()` (each clean capture's snapped rise/fall). In
+`identity.match_identities` (engine/learning/identity.py) a capture-origin prior sorts first in
+the greedy one-to-one pass (D-07), so a capture of a dismissed shape reconciles instead of being
+twin-suppressed; and a containment-anchor pass matches a still-unmatched learned artefact to a
+capture prior when the artefact's own claims — the union of the train, validation and holdout
+block replays — contain the captured episode within `ANCHOR_TOL_STEPS` grid steps. An anchor
+attached to a learned candidate therefore anchors that candidate's identity: a later LLM artefact
+for the same run keeps the learned id — **same load, same identity** — because the artefact must
+itself claim the captured run (T-08-24, never a hijack). `worker.compile_score` maps each job
+`capture_anchors` entry to the episode rows its rise/fall lies within tolerance of, drops an
+anchor that maps to no row, and names the dropped ids in the output's `anchors_unmapped`, which
+`learning` logs at debug level.
+
+Captured windows are excluded from holdout validation from day one: every capture record carries
+a holdout-exclusion marker, `run_validation` passes the capture windows to the validate stages,
+and the report's `holdout.excluded_capture` names the windows that overlap the holdout and the
+samples removed (engine/capture/exclusion.py). Captures whose target no longer resolves surface
+in Review with a notice and as a non-fixable Repairs issue.
+
 ## Key abstractions
 
 | Abstraction | Location | Purpose |
@@ -158,15 +217,18 @@ subtracted live from the remainder exactly once (hub.py).
 | `ConsentStore` | `custom_components/powerguesser/consent.py` | Persisted, destination-bound LLM consent records. |
 | `review_actions` | `custom_components/powerguesser/review_actions.py` | Shared review backend for the options flow (and the later panel): confirm / rename / dismiss / merge for candidates and devices with typed errors, plus `evidence_view` and `evidence_text`. |
 | `build_evidence` / evidence statistics | `custom_components/powerguesser/engine/learning/evidence.py` | HA-free per-candidate evidence: recent occurrences, rhythm, power/energy profile and heuristic hints. Pure, so the flow, the worker stage and the later panel reuse it. |
+| `CaptureManager` | `custom_components/powerguesser/capture.py` | Guided-capture Store (`powerguesser.captures`), the seven admin services, read-time preview candidates, capture priors and anchors for reconciliation, and the orphan Repairs issue. |
+| capture engine | `custom_components/powerguesser/engine/capture/` | HA-free capture snap (window, snap, preview, replay_check, exclusion, constants/config): retro/live window validation, the residual snap, the D-02 preview fit, the D-04 read-only replay check and the D-05 holdout exclusion. |
 
 ## Directory structure rationale
 
 ```text
 custom_components/powerguesser/        Home Assistant integration package
-├── __init__.py                        Setup/unload, admin services (learn, preview, run_validation)
+├── __init__.py                        Setup/unload, admin services (learn, preview_learning_payload, run_validation, capture_window/start/stop/cancel/list/delete/reassign)
 ├── config_flow.py                     Config/options flow and device subentries
 ├── hub.py, buffer_writer.py           Runtime coordinator and buffer write path
 ├── learning.py, validation.py         Supervisors for the worker subprocess pipelines
+├── capture.py                         Guided capture: captures Store, admin services, previews
 ├── devices.py, review_store.py        Confirmed devices and candidate review state
 ├── review_actions.py                  Shared review backend (confirm/rename/dismiss/merge, evidence view)
 ├── llm_client.py, consent.py          LLM transport and consent (learning phase only)
@@ -181,6 +243,7 @@ custom_components/powerguesser/        Home Assistant integration package
     ├── llm_wire.py                         LLM wire formats and probe strategy (pure)
     ├── worker_entry.py                     Standalone subprocess entrypoint
     ├── detect/                             Online detection (stream, online, joint, program, replay)
+    ├── capture/                            Guided capture (window, snap, preview, replay_check, exclusion, constants)
     ├── learning/                           Learning stages (episodes, digest, prompts, compile, score, split, evidence, worker)
     └── validation/                         Holdout validation (link, metrics, classes, drift, report)
 

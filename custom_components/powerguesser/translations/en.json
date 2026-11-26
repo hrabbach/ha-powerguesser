@@ -62,7 +62,7 @@
       },
       "review": {
         "title": "Review device candidates",
-        "description": "Candidates from the last learning run, ranked by the share of unexplained energy they explain. The figures are local consistency checks on training and validation days; measured accuracy against real plug readings comes in a later version. Pick a candidate, then close the dialog when you are done.",
+        "description": "Candidates from the last learning run, ranked by the share of unexplained energy they explain. The figures are local consistency checks on training and validation days; measured accuracy against real plug readings comes in a later version. Pick a candidate, then close the dialog when you are done.{captures_notice}",
         "data": {
           "candidate": "Candidate"
         }
@@ -98,7 +98,8 @@
         "title": "Confirm device",
         "description": "{candidate}{warning}\n\nConfirming creates a device with power and energy sensors that PowerGuesser estimates locally.",
         "data": {
-          "name": "Device name"
+          "name": "Device name",
+          "confirm_anyway": "Confirm anyway"
         }
       },
       "rename": {
@@ -193,11 +194,13 @@
       "plug_is_source": "This sensor is already an Energy dashboard source or metered device, so it would be subtracted twice.",
       "plug_in_session": "This plug is already used by an active plug session. End that session first.",
       "end_date_past": "The end date must be in the future.",
-      "name_invalid": "Enter a name of 1 to 64 characters without control characters."
+      "name_invalid": "Enter a name of 1 to 64 characters without control characters.",
+      "preview_needs_runs": "This preview is based on too few captured runs. Tick Confirm anyway to confirm it regardless."
     },
     "abort": {
       "not_loaded": "PowerGuesser is not running. Reload the integration, then try again.",
-      "no_candidates": "There are no candidates to review yet. Run learning first."
+      "no_candidates": "There are no candidates to review yet. Run learning first.",
+      "orphan_captures": "{count} captured run(s): target no longer exists: reassign or delete them with the PowerGuesser capture actions."
     }
   },
   "selector": {
@@ -216,6 +219,13 @@
         "fri": "Friday",
         "sat": "Saturday",
         "sun": "Sunday"
+      }
+    },
+    "capture_target_type": {
+      "options": {
+        "new_device": "A new device",
+        "candidate": "An existing candidate",
+        "device": "A confirmed device"
       }
     }
   },
@@ -259,6 +269,10 @@
     "buffer_reset": {
       "title": "PowerGuesser started a new data buffer",
       "description": "The existing buffer file could not be read (for example after a power cut or SD-card fault). It was kept as {backup} in the powerguesser folder of the configuration directory. Collected history starts again from now, and the notice disappears after the next restart."
+    },
+    "capture_orphans": {
+      "title": "Captured runs have no target",
+      "description": "{count} captured run(s): target no longer exists: reassign or delete them with the PowerGuesser capture actions (capture_reassign, capture_delete)."
     },
     "llm_auth": {
       "title": "PowerGuesser cannot sign in to the LLM endpoint",
@@ -523,6 +537,120 @@
           "description": "Adds a clearly labelled synthetic overlap block by time-shifting one plug onto another. Real figures are not changed."
         }
       }
+    },
+    "capture_window": {
+      "name": "Capture a window",
+      "description": "Snaps a past start/end window to the real rise and fall edges of a device run, stores the capture and returns it. Captures stay local and appear in Review as a preview candidate.",
+      "fields": {
+        "start": {
+          "name": "Start",
+          "description": "The local start time of the run (interpreted in the Home Assistant time zone)."
+        },
+        "end": {
+          "name": "End",
+          "description": "The local end time of the run."
+        },
+        "label": {
+          "name": "Label",
+          "description": "A short label for this capture."
+        },
+        "target_type": {
+          "name": "Target type",
+          "description": "What the capture teaches: a new device, an existing Review candidate, or a confirmed device."
+        },
+        "target": {
+          "name": "Target",
+          "description": "A new device's name; a candidate's name or signature id; a confirmed device's name or uuid when no device is picked."
+        },
+        "device_id": {
+          "name": "Device",
+          "description": "Pick a confirmed PowerGuesser device (a shortcut for a device name or uuid target)."
+        }
+      }
+    },
+    "capture_list": {
+      "name": "List captures",
+      "description": "Returns every stored capture (or the one named by capture_id) with its result block, the interpreted window and its read-time resolved target.",
+      "fields": {
+        "capture_id": {
+          "name": "Capture ID",
+          "description": "Return only this capture. Omit to return every capture."
+        }
+      }
+    },
+    "capture_start": {
+      "name": "Start a live capture",
+      "description": "Starts a live capture (\"on now\"). Stop it with capture_stop; read the result with capture_list. Only one capture can be open at a time.",
+      "fields": {
+        "label": {
+          "name": "Label",
+          "description": "A short label for this capture."
+        },
+        "target_type": {
+          "name": "Target type",
+          "description": "What the capture teaches: a new device, an existing Review candidate, or a confirmed device."
+        },
+        "target": {
+          "name": "Target",
+          "description": "A new device's name; a candidate's name or signature id; a confirmed device's name or uuid when no device is picked."
+        },
+        "device_id": {
+          "name": "Device",
+          "description": "Pick a confirmed PowerGuesser device (a shortcut for a device name or uuid target)."
+        }
+      }
+    },
+    "capture_stop": {
+      "name": "Stop a live capture",
+      "description": "Stops the open live capture and returns at once with state resolving. The snapped result appears after the settle wait in capture_list and Review.",
+      "fields": {
+        "capture_id": {
+          "name": "Capture ID",
+          "description": "Stop this capture. Omit to stop the one open capture."
+        }
+      }
+    },
+    "capture_cancel": {
+      "name": "Cancel a capture",
+      "description": "Cancels an open capture. Idempotent on a finished capture.",
+      "fields": {
+        "capture_id": {
+          "name": "Capture ID",
+          "description": "Cancel this capture. Omit to cancel the one open capture."
+        }
+      }
+    },
+    "capture_delete": {
+      "name": "Delete a capture",
+      "description": "Deletes a stored capture and returns whether its preview card was removed. Idempotent on an id that no longer exists.",
+      "fields": {
+        "capture_id": {
+          "name": "Capture ID",
+          "description": "Delete this capture."
+        }
+      }
+    },
+    "capture_reassign": {
+      "name": "Re-assign a capture",
+      "description": "Moves a capture to a new target. The only action that rewrites a capture's target; a device target recomputes its read-only replay check.",
+      "fields": {
+        "capture_id": {
+          "name": "Capture ID",
+          "description": "Re-assign this capture."
+        },
+        "target_type": {
+          "name": "Target type",
+          "description": "What the capture teaches: a new device, an existing Review candidate, or a confirmed device."
+        },
+        "target": {
+          "name": "Target",
+          "description": "A new device's name; a candidate's name or signature id; a confirmed device's name or uuid when no device is picked."
+        },
+        "device_id": {
+          "name": "Device",
+          "description": "Pick a confirmed PowerGuesser device (a shortcut for a device name or uuid target)."
+        }
+      }
     }
   },
   "exceptions": {
@@ -546,6 +674,57 @@
     },
     "validation_failed": {
       "message": "Validation failed: {error}"
+    },
+    "capture_invalid_name": {
+      "message": "The capture label or device name is invalid: {reason}"
+    },
+    "capture_invalid_window": {
+      "message": "The capture window is invalid: {reason}"
+    },
+    "capture_future_end": {
+      "message": "The capture window ends in the future ({end}); pick a window that has already finished."
+    },
+    "capture_window_too_long": {
+      "message": "The capture window is longer than the {max_hours} h maximum; pick a shorter window."
+    },
+    "capture_too_short_for_rate": {
+      "message": "The capture window is too short for this meter's sample interval (at least {min_seconds} s of data are needed)."
+    },
+    "capture_interval_too_coarse": {
+      "message": "This meter's sample interval is too coarse to detect a step: {reason}."
+    },
+    "capture_outside_buffer": {
+      "message": "The window is outside the buffered history ({buffer_start} to {buffer_end})."
+    },
+    "capture_across_gap": {
+      "message": "The window crosses a gap in the buffer ({gap_start} to {gap_end}); pick a window without the gap."
+    },
+    "capture_ambiguous_local_time": {
+      "message": "The start or end time is ambiguous in the Home Assistant time zone ({value}); it falls in a repeated hour. Provide a time with an explicit offset."
+    },
+    "capture_nonexistent_local_time": {
+      "message": "The start or end time does not exist in the Home Assistant time zone ({value}); it falls in a skipped hour. Pick another time."
+    },
+    "capture_already_open": {
+      "message": "A capture is already open ({capture_id}); stop or cancel it first."
+    },
+    "capture_not_open": {
+      "message": "No capture is open."
+    },
+    "capture_not_found": {
+      "message": "No capture with id {capture_id} exists."
+    },
+    "capture_target_unknown": {
+      "message": "No capture target matches {target}. Visible choices: {choices}."
+    },
+    "capture_target_ambiguous": {
+      "message": "The capture target {target} is ambiguous; it matches more than one target: {choices}."
+    },
+    "capture_busy": {
+      "message": "Capture {capture_id} is still open; stop or cancel it before re-assigning it."
+    },
+    "capture_store_full": {
+      "message": "PowerGuesser keeps at most {limit} captures; only taught captures remain, so no new capture can be stored. Delete a capture first."
     }
   }
 }

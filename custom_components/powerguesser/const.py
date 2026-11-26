@@ -71,6 +71,13 @@ LEARNING_STORES_VERSION = 1
 SESSIONS_STORE_KEY = "powerguesser.review_sessions"
 SESSIONS_STORE_VERSION = 1
 
+# Capture records (Plan 08-01, D-05): captures live in their own Store so a
+# ReviewStore decision writer can never erase them (RESEARCH Pitfall 7). The
+# record schema and this v1 key are consumed by Phase 9 learning and the Phase
+# 10 websocket contract, so they are frozen from day one.
+CAPTURES_STORE_KEY = "powerguesser.captures"
+CAPTURES_STORE_VERSION = 1
+
 # Holdout validation Stores (Plan 05-01): the stored shadow set (D-01 contract;
 # written by Plan 05-03) and the latest validation report plus the stored
 # per-plug class map. Version 1 schemas are costly: readers and writers across
@@ -80,6 +87,18 @@ VALIDATION_STORE_KEY = "powerguesser.validation"
 VALIDATION_STORES_VERSION = 1
 VALIDATION_DIR = "validation"
 SERVICE_RUN_VALIDATION = "run_validation"
+
+# Capture admin services (Plan 08-01, CAP-06). SERVICE_CAPTURE_LIST is added by
+# Plan 08-01 Task 2; the live capture actions by Plan 08-03 Task 3.
+SERVICE_CAPTURE_WINDOW = "capture_window"
+SERVICE_CAPTURE_LIST = "capture_list"
+SERVICE_CAPTURE_START = "capture_start"
+SERVICE_CAPTURE_STOP = "capture_stop"
+SERVICE_CAPTURE_CANCEL = "capture_cancel"
+# Plan 08-05 Task 2 adds the delete/re-assign actions and the orphan issue.
+SERVICE_CAPTURE_DELETE = "capture_delete"
+SERVICE_CAPTURE_REASSIGN = "capture_reassign"
+ISSUE_CAPTURE_ORPHANS = "capture_orphans"
 
 # Device lifecycle Stores (Plan 04-03): cold device records and hot runtime
 # state (energy totals, detector state). Version 1 schemas are pinned by

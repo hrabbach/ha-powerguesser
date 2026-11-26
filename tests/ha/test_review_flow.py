@@ -16,6 +16,13 @@ from custom_components.powerguesser.const import (
     DOMAIN,
     LEARNING_STORES_VERSION,
     REVIEW_STORE_KEY,
+    SERVICE_CAPTURE_CANCEL,
+    SERVICE_CAPTURE_DELETE,
+    SERVICE_CAPTURE_LIST,
+    SERVICE_CAPTURE_REASSIGN,
+    SERVICE_CAPTURE_START,
+    SERVICE_CAPTURE_STOP,
+    SERVICE_CAPTURE_WINDOW,
     SERVICE_RUN_VALIDATION,
 )
 from tests.conftest import (
@@ -222,14 +229,25 @@ async def test_no_review_services_registered(
     energy_manager: EnergyManager,
     std_prefs: dict[str, Any],
 ) -> None:
-    """Review services are not registered; exactly learn, preview_learning_payload
-    and run_validation exist (D-04)."""
+    """Review services are not registered; exactly learn, preview_learning_payload,
+    run_validation and the Phase 8 capture actions exist (D-04)."""
     energy_manager.data = std_prefs
     _set_std_powers(hass)
     await async_setup_via_flow(hass)
 
     services = hass.services.async_services().get(DOMAIN, {})
-    assert set(services.keys()) == {"learn", "preview_learning_payload", SERVICE_RUN_VALIDATION}
+    assert set(services.keys()) == {
+        "learn",
+        "preview_learning_payload",
+        SERVICE_RUN_VALIDATION,
+        SERVICE_CAPTURE_WINDOW,
+        SERVICE_CAPTURE_LIST,
+        SERVICE_CAPTURE_START,
+        SERVICE_CAPTURE_STOP,
+        SERVICE_CAPTURE_CANCEL,
+        SERVICE_CAPTURE_DELETE,
+        SERVICE_CAPTURE_REASSIGN,
+    }
 
 
 async def test_rename_candidate_valid_and_invalid(

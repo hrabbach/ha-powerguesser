@@ -99,7 +99,8 @@ from .engine.buffer import KIND_METERED, KIND_PHASE, KIND_SESSION, RETENTION_DAY
 from .engine.coverage import MS_PER_DAY
 from .engine.intervals import gate
 from .engine.learning import prompts, proposal
-from .engine.learning.artefact import SignatureArtefact
+from .engine.learning.artefact import SignatureArtefact, fingerprint_of
+from .engine.learning.identity import similar_dismissed
 from .engine.learning.budget import (
     BYTES_PER_TOKEN,
     CAP_ORDER,
@@ -1056,6 +1057,27 @@ class LearningSupervisor:
             )
         return labels
 
+    def build_context_job(self) -> dict[str, Any]:
+        """Build the capture channel context, executor only.
+
+        Must run in the executor: it delegates to _build_extract_job_data,
+        which reads the buffer's channel rows through SQLite (a blocking call)
+        and reads the profile coordinator's snapshot. Returns the six keys the
+        capture snap needs: buffer_path, grid_s, enabled_event_types,
+        metered_channels, phase_channels and session_windows.
+        """
+        job_extract, _cache_key, _window_end_ms = self._build_extract_job_data(
+            Path(self.hass.config.path(BUFFER_DIR, LEARNING_DIR))
+        )
+        return {
+            "buffer_path": job_extract["buffer_path"],
+            "grid_s": job_extract["grid_s"],
+            "enabled_event_types": job_extract["enabled_event_types"],
+            "metered_channels": job_extract["metered_channels"],
+            "phase_channels": job_extract["phase_channels"],
+            "session_windows": job_extract["session_windows"],
+        }
+
     def build_window_job(self, stage_dir: Path) -> dict[str, Any]:
         """Build a window-only job (buffer_path, grid_s, day_bounds_ms, enabled_event_types, phase_channels).
 
@@ -1283,6 +1305,17 @@ class LearningSupervisor:
                 sig_id = cand.get("signature_id", "")
                 if sig_id and sig_id not in stored_sigs and sig_id not in owned:
                     stored.append(cand)
+        # Capture previews (CAP-09, Plan 08-01) are derived at read time from the
+        # capture records, never written into the candidates Store (which every
+        # run and rescore rewrites wholesale). A preview is skipped when a stored
+        # candidate already carries its signature id or when it is owned.
+        captures = getattr(self.hub, "captures", None)
+        if captures is not None:
+            stored_sigs = {c.get("signature_id") for c in stored}
+            for cand in captures.preview_candidates():
+                sig_id = cand.get("signature_id", "")
+                if sig_id and sig_id not in stored_sigs and sig_id not in owned:
+                    stored.append(cand)
         visible: list[dict[str, Any]] = []
         for c in stored:
             ident = c.get("identity") or {}
@@ -1480,6 +1513,33 @@ class LearningSupervisor:
         if aliases:
             name = f"{name} (+{len(aliases)} merged)"
         scores = candidate.get("scores") or {}
+        if candidate.get("origin") == "capture":
+            # CAP-09/D-03: a capture preview reports its clean captured example
+            # count, never a residual-energy share (it carries no train share).
+            n_examples = int(scores.get("n_examples") or 0)
+            noun = "example" if n_examples == 1 else "examples"
+            label = (
+                f"{name} — from {n_examples} captured {noun} — "
+                "preview, not yet validated"
+            )
+            # D-07 (HA half): a re-captured dismissed shape stays visible and is
+            # noted, before the overlaps and plug-session suffixes.
+            if similar_dismissed(candidate, self.review.decisions) is not None:
+                label += " — similar to a candidate you dismissed"
+            if include_overlaps:
+                ident = candidate.get("identity") or {}
+                overlaps = ident.get("overlaps")
+                if overlaps:
+                    devices = getattr(self.hub, "devices", None)
+                    owner = (
+                        devices.owner_name(str(overlaps))
+                        if devices is not None
+                        else None
+                    )
+                    label += " — overlaps " + (owner or "a confirmed device")
+            if self._session_target_active("candidate", str(sig_id)):
+                label += " — plug session active"
+            return label
         train = scores.get("train") or {}
         train_share = float(train.get("share") or 0.0)
         share_pct = f"{train_share * 100:.1f}"
@@ -1564,7 +1624,7 @@ class LearningSupervisor:
         if cand is None:
             raise CandidateGone(f"Candidate {sig_id} is no longer visible")
 
-        fp = cand.get("fingerprint")
+        fp = fingerprint_of(cand)
         if action == "dismiss":
             await self.review.async_dismiss(sig_id, fp, label=self._display_name(cand))
         elif action == "rename":
@@ -1580,7 +1640,7 @@ class LearningSupervisor:
                 s_cand = next((c for c in visible if c.get("signature_id") == s_id), None)
                 if s_cand is None or s_id == sig_id:
                     raise CandidateGone(f"Source candidate {s_id} is no longer visible")
-                source_pairs.append((s_id, s_cand.get("fingerprint")))
+                source_pairs.append((s_id, fingerprint_of(s_cand)))
             await self.review.async_merge(
                 sig_id, fp, source_pairs, label=self._display_name(cand)
             )
@@ -1685,7 +1745,7 @@ class LearningSupervisor:
             await self.review.async_merge(
                 target_sig,
                 target_fp,
-                [(source_sig, cand.get("fingerprint"))],
+                [(source_sig, fingerprint_of(cand))],
                 label=target_name,
             )
             await devices.async_add_aliases(
@@ -1954,6 +2014,21 @@ class LearningSupervisor:
                 names = self._plug_names(meta, channel_rows)
 
             devices = getattr(self.hub, "devices", None)
+            captures = getattr(self.hub, "captures", None)
+            # CAP-09 (Plan 08-08): capture previews join the identity context as
+            # priors (after the stored candidates, before the devices so a
+            # confirmed device stays authoritative per id), with their ids marked
+            # for D-07 precedence and their clean captured runs as containment
+            # anchors. Empty without a capture manager.
+            capture_priors = (
+                captures.identity_priors() if captures is not None else []
+            )
+            capture_prior_ids = (
+                captures.capture_prior_ids() if captures is not None else []
+            )
+            capture_anchors = (
+                captures.capture_anchors() if captures is not None else []
+            )
             await self._async_llm_rounds(
                 stage_dir=stage_dir,
                 run_id=run_id,
@@ -1961,6 +2036,7 @@ class LearningSupervisor:
                 digest=digest,
                 names=names,
                 prior=list(self.candidates)
+                + capture_priors
                 + (devices.identity_priors() if devices is not None else []),
                 owned=(
                     sorted(devices.owned_signature_ids())
@@ -1975,6 +2051,10 @@ class LearningSupervisor:
                 # Plan 07-01 (D-11): the production run computes and attaches
                 # per-candidate evidence; the shadow pass below writes False.
                 with_evidence=True,
+                # CAP-09 (Plan 08-08): the local compile job only — never a
+                # prompt (T-08-25).
+                capture_anchors=capture_anchors,
+                capture_prior_ids=capture_prior_ids,
             )
             best_library = state.best_library
 
@@ -2334,6 +2414,8 @@ class LearningSupervisor:
         state: _RoundsState,
         actives: dict[str, Any],
         with_evidence: bool,
+        capture_anchors: list[dict[str, Any]],
+        capture_prior_ids: list[str],
     ) -> None:
         """Run the shared R1 + refinement LLM rounds and compile scores.
 
@@ -2354,7 +2436,10 @@ class LearningSupervisor:
         library. ``with_evidence`` is forwarded to the compile job verbatim:
         the production run passes True and the shadow pass False, and the
         worker attaches per-candidate evidence only when the job sets that key
-        to exactly True (Plan 07-01, D-11).
+        to exactly True (Plan 07-01, D-11). ``capture_anchors`` and
+        ``capture_prior_ids`` (CAP-09, Plan 08-08) ride the local compile job
+        only — never a prompt — and only when non-empty, so a capture-free run
+        keeps a byte-identical job and output.
         """
         cluster_ids = [c["id"] for c in digest.get("clusters", [])]
         plug_ids = [p["id"] for p in digest.get("plugs", [])]
@@ -2415,6 +2500,13 @@ class LearningSupervisor:
                 "with_evidence": with_evidence,
                 "now_iso": dt_util.utcnow().isoformat(),
             }
+            # CAP-09 (Plan 08-08): capture anchors and priors go only into the
+            # local compile job (never a prompt, T-08-25), and only when
+            # non-empty so a capture-free job keeps its exact shape and output.
+            if capture_anchors:
+                job_compile["capture_anchors"] = capture_anchors
+            if capture_prior_ids:
+                job_compile["capture_prior_ids"] = capture_prior_ids
             job_compile_path = stage_dir / f"job_compile_{round_num}.json"
             job_compile_path.write_text(
                 json.dumps(job_compile, indent=2), encoding="utf-8"
@@ -2427,6 +2519,14 @@ class LearningSupervisor:
             "compile_score",
             await self._async_run_stage("compile_score", job_compile_path),
         )
+        # CAP-09 (Plan 08-08): a capture anchor that maps to no episode row is
+        # dropped by the worker and named here, so a capture that silently fails
+        # to anchor is visible in a debug log (the engine has no logging).
+        unmapped = compile_out.get("anchors_unmapped")
+        if unmapped:
+            _LOGGER.debug(
+                "capture anchor maps to no episode row: %s", ", ".join(unmapped)
+            )
 
         def _read_library(round_num: int) -> list[dict[str, Any]]:
             lib_path = stage_dir / f"library_{round_num}.json"
@@ -2531,6 +2631,12 @@ class LearningSupervisor:
                     "compile_score",
                     await self._async_run_stage("compile_score", job_k_path),
                 )
+                unmapped_k = compile_out_k.get("anchors_unmapped")
+                if unmapped_k:
+                    _LOGGER.debug(
+                        "capture anchor maps to no episode row: %s",
+                        ", ".join(unmapped_k),
+                    )
                 library_k: list[dict[str, Any]] | None = None
                 if compile_out_k["accepted"] is True:
                     library_k = await self.hass.async_add_executor_job(_read_library, k)
@@ -2684,6 +2790,10 @@ class LearningSupervisor:
                     # Plan 07-01: the shadow set stays lean — no evidence is
                     # computed or stored for shadow artefacts.
                     with_evidence=False,
+                    # CAP-09 (Plan 08-08): the shadow pass carries no capture
+                    # data (T-08-25).
+                    capture_anchors=[],
+                    capture_prior_ids=[],
                 )
 
             def _write_shadow_library() -> str:

@@ -57,7 +57,7 @@ from .engine.detect.online import (
 from .engine.detect.stats import TickTimer
 from .engine.detect.stream import GridResampler
 from .engine.intervals import EVENT_TYPE_MIN_S, EventType, gate
-from .engine.learning.artefact import SignatureArtefact, detection_differs
+from .engine.learning.artefact import SignatureArtefact, detection_differs, fingerprint_of
 from .engine.learning.episodes import MIN_EDGE_W
 from .engine.model import Problem, Severity, Snapshot
 from .engine.validation.classes import derive_class
@@ -2459,7 +2459,7 @@ class DeviceRuntime:
         await self.hub.learning.review.async_set_device_link(
             signature_id,
             name=name,
-            fingerprint=candidate.get("fingerprint"),
+            fingerprint=fingerprint_of(candidate),
             # The review-record label stays the plain recognition label; the
             # D-27 " — overlaps …" note is a display-only suffix (D-27).
             label=self.hub.learning.candidate_label(candidate, include_overlaps=False),

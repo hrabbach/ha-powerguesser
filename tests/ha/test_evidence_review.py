@@ -6,6 +6,7 @@ boundary tests (D-03, D-06, D-08, D-09, D-11, D-19).
 """
 
 import json
+import copy
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ import pytest
 
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.util import dt as dt_util
 
 from custom_components.powerguesser import review_actions
 from custom_components.powerguesser.config_flow import _escape_markdown
@@ -25,6 +27,7 @@ from custom_components.powerguesser.const import (
     EVIDENCE_MAX_FAILURES,
     LEARNING_DIR,
 )
+from custom_components.powerguesser.engine.intervals import ProfileSnapshot, gate
 from custom_components.powerguesser.engine.learning.evidence import (
     MAX_OCCURRENCES,
     MIN_RHYTHM_RUNS,
@@ -39,6 +42,7 @@ from custom_components.powerguesser.review_actions import (
     format_duration,
     format_energy_wh,
     format_gap,
+    overlay_captured,
 )
 from tests.conftest import (
     async_confirm_candidate,
@@ -53,6 +57,7 @@ from tests.conftest import (
     proposal_responder,
     seed_candidates,
 )
+from tests.fixtures.learning.synth import SynthSpec
 
 _DAY_MS = 86_400_000
 _BASE_MS = 1_700_000_000_000
@@ -334,7 +339,7 @@ def test_sections_are_blank_line_separated(n_runs: int) -> None:
 
 
 def test_occurrence_list_boundaries() -> None:
-    """5 runs: 5 bullets, no more-line; 6: newest 5 + more; 0: none."""
+    """5 runs: 5 bullets, no more-line; 6: newest 5 + more; 0: none; capped: true total."""
     five = evidence_text(_evidence(5), "ready").split("\n")
     assert len([ln for ln in five if ln.startswith("- ")]) == 5
     assert not any("…and" in ln for ln in five)
@@ -347,6 +352,27 @@ def test_occurrence_list_boundaries() -> None:
     zero = evidence_text(_evidence(0), "ready").split("\n")
     assert "Recent runs: none" in zero
     assert zero[2].startswith("0 runs")
+
+    # The stored occurrence list is capped at MAX_OCCURRENCES (25); the tail must
+    # count the true total (n_runs), not len(occurrences) (which would read 20).
+    capped = evidence_text(_evidence(30), "ready").split("\n")
+    assert len([ln for ln in capped if ln.startswith("- ") and "…and" not in ln]) == 5
+    assert "- …and 25 more" in capped
+
+
+def test_overlay_on_zero_run_evidence_lists_the_captures() -> None:
+    """A capture-only group (zero detected runs) lists its captures, not "none"."""
+    ev = _evidence(0)
+    assert "Recent runs: none" in evidence_text(ev, "ready")
+
+    out = overlay_captured(ev, [_run(_BASE_MS)], 30_000)
+    assert out["n_runs"] == 0
+    assert out["n_captured_unmatched"] == 1
+    block = evidence_text(out, "ready")
+    assert "Recent runs: none" not in block
+    assert "Recent runs, newest first:" in block
+    assert "0 runs, 1 captured" in block
+    assert len(_bullets(block)) == 1
 
 
 def test_energy_and_duration_formatting() -> None:
@@ -945,5 +971,392 @@ def test_strings_identical_and_placeholders() -> None:
     step = json.loads(strings_bytes)["options"]["step"]
     assert step["candidate"]["description"] == "{candidate}\n\n{evidence}"
     assert step["device"]["description"] == "{candidate}\n\n{evidence}"
+
+
+# ---------------------------------------------------------------------------
+# EVID-05: evidence marks user-captured occurrences (Plan 08-07)
+# ---------------------------------------------------------------------------
+_GRID_S = 30
+_DAY = 86_400_000
+
+
+def _pin_grid(entry: Any) -> None:
+    enabled, disabled = gate(float(_GRID_S), False)
+    entry.runtime_data.profile_coordinator.async_set_updated_data(
+        ProfileSnapshot(
+            sources={},
+            effective_s=float(_GRID_S),
+            assumed=False,
+            enabled=enabled,
+            disabled=disabled,
+        )
+    )
+
+
+def _iso_utc(ms: int) -> str:
+    return dt_util.utc_from_timestamp(ms / 1000.0).isoformat()
+
+
+async def _setup_capture(
+    hass: HomeAssistant,
+    energy_manager: Any,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+    *,
+    candidates: list[dict[str, Any]] | None = None,
+    spec: SynthSpec | None = None,
+) -> tuple[Any, Any]:
+    """Set up a loaded entry with a synthetic buffer and pinned 30 s grid."""
+    if candidates:
+        seed_candidates(hass_storage, candidates)
+    energy_manager.data = copy.deepcopy(std_prefs)
+    async_set_power(hass, "sensor.grid_power", 500)
+    async_set_power(hass, "sensor.solar_power", 0)
+    async_set_power(hass, "sensor.battery_power", 0)
+    async_set_power(hass, "sensor.washer_power", 0)
+    entry = await async_setup_via_flow(hass)
+    _pin_grid(entry)
+    await hass.async_block_till_done()
+    data = await async_fill_synth_buffer(hass, entry, spec or SynthSpec(days=3))
+    return entry, data
+
+
+async def _capture_window(
+    hass: HomeAssistant,
+    *,
+    start_ms: int,
+    end_ms: int,
+    label: str = "run",
+    target_type: str = "new_device",
+    target: str = "Kettle",
+) -> dict[str, Any]:
+    return await hass.services.async_call(
+        DOMAIN,
+        "capture_window",
+        {
+            "start": _iso_utc(start_ms),
+            "end": _iso_utc(end_ms),
+            "label": label,
+            "target_type": target_type,
+            "target": target,
+        },
+        blocking=True,
+        return_response=True,
+    )
+
+
+def _run(
+    rise_ms: int,
+    *,
+    capture_id: str = "c0",
+    verdict: str = "clean",
+    step_w: float = 2000.0,
+    dur_s: float = 180.0,
+    energy_wh: float = 100.0,
+    grid_s: float = 30.0,
+) -> dict[str, Any]:
+    """One captured_runs entry shape."""
+    return {
+        "capture_id": capture_id,
+        "rise_ms": rise_ms,
+        "fall_ms": rise_ms + int(dur_s * 1000),
+        "step_w": step_w,
+        "dur_s": dur_s,
+        "energy_wh": energy_wh,
+        "grid_s": grid_s,
+        "verdict": verdict,
+    }
+
+
+def _occ(start_ms: int) -> dict[str, Any]:
+    return {
+        "start_ms": start_ms,
+        "dur_s": 660.0,
+        "step_w": 2150.0,
+        "energy_wh": 390.0,
+        "phase": None,
+    }
+
+
+def _occ_evidence(starts: list[int]) -> dict[str, Any]:
+    """A ready evidence dict whose occurrences are the given starts (unsorted)."""
+    ev = _evidence(len(starts))
+    ev["occurrences"] = [_occ(s) for s in starts]
+    ev["n_runs"] = len(starts)
+    return ev
+
+
+def _bullets(block: str) -> list[str]:
+    return [ln for ln in block.split("\n") if ln.startswith("- ") and "…and" not in ln]
+
+
+# --- overlay_captured unit tests (Edge EVID-05) -----------------------------
+
+
+def test_overlay_adjacency_boundary() -> None:
+    """One grid step (inclusive) marks; one ms more appends; dedupe prefers the clean capture."""
+    s = 1_700_000_000_000
+    step = 30_000
+    ev = _occ_evidence([s])
+
+    marked = overlay_captured(ev, [_run(s + step)], step)
+    assert marked["occurrences"][0]["captured"] is True
+    assert marked["n_captured"] == 1
+    assert marked["n_captured_unmatched"] == 0
+
+    unmatched = overlay_captured(ev, [_run(s + step + 1)], step)
+    assert unmatched["n_captured"] == 1
+    assert unmatched["n_captured_unmatched"] == 1
+    appended = [o for o in unmatched["occurrences"] if o.get("detected") is False]
+    assert len(appended) == 1
+    assert appended[0]["start_ms"] == s + step + 1
+    detected = [o for o in unmatched["occurrences"] if o.get("detected") is not False]
+    assert detected[0].get("captured") is not True
+
+    # Two captures of the same run mark one occurrence and count once.
+    dup = overlay_captured(
+        ev, [_run(s + step, capture_id="a"), _run(s + step, capture_id="b")], step
+    )
+    assert dup["n_captured"] == 1
+    assert dup["n_captured_unmatched"] == 0
+
+    # Two unmatched captures 10 s apart are appended once.
+    two = overlay_captured(
+        ev,
+        [_run(s + step + 1_000, capture_id="a"), _run(s + step + 11_000, capture_id="b")],
+        step,
+    )
+    assert two["n_captured_unmatched"] == 1
+
+    # The single appended entry carries the clean capture's values whichever order.
+    contaminated = _run(
+        s + step + 1_000, capture_id="a", verdict="contaminated",
+        step_w=9999.0, dur_s=11.0, energy_wh=22.0,
+    )
+    clean = _run(
+        s + step + 1_000, capture_id="b", verdict="clean",
+        step_w=2000.0, dur_s=180.0, energy_wh=100.0,
+    )
+    for runs in ([contaminated, clean], [clean, contaminated]):
+        out = overlay_captured(ev, runs, step)
+        assert out["n_captured_unmatched"] == 1
+        app = [o for o in out["occurrences"] if o.get("detected") is False]
+        assert len(app) == 1
+        assert app[0]["step_w"] == 2000.0
+        assert app[0]["dur_s"] == 180.0
+        assert app[0]["energy_wh"] == 100.0
+
+
+def test_overlay_marks_across_grid_phase() -> None:
+    """A rise offset by half a step or one step minus 1 ms still marks the occurrence."""
+    s = 1_700_000_000_000
+    step = 30_000
+    ev = _occ_evidence([s])
+    for offset in (15_000, step - 1):
+        out = overlay_captured(ev, [_run(s + offset)], step)
+        assert out["n_captured"] == 1
+        assert out["n_captured_unmatched"] == 0
+        assert out["occurrences"][0]["captured"] is True
+
+
+def test_overlay_without_captures_is_identical() -> None:
+    """No captures returns the evidence unchanged and the same rendered text."""
+    ev = _ready(6)
+    assert overlay_captured(ev, [], 30_000) is ev
+    assert evidence_text(overlay_captured(ev, [], 30_000), "ready") == evidence_text(
+        ev, "ready"
+    )
+    # A none-verdict capture has no pair and never reaches the overlay.
+    assert "captured" not in evidence_text(overlay_captured(ev, [], 30_000), "ready")
+
+
+def test_overlay_ordering_and_more_count() -> None:
+    """Detected and appended runs merge newest first; the tail counts every occurrence."""
+    base = 1_700_000_000_000
+    starts = [base - i * _DAY for i in range(7)]
+    ev = _occ_evidence(starts)
+    step = 30_000
+    newer = starts[0] + 3_600_000
+    between = starts[3] - 3_600_000  # between the 4th and 5th newest (index 5)
+    out = overlay_captured(
+        ev, [_run(newer, capture_id="A"), _run(between, capture_id="B")], step
+    )
+    ordered = [o["start_ms"] for o in out["occurrences"]]
+    assert ordered == sorted(ordered, reverse=True)
+    assert ordered[0] == newer
+    assert ordered.index(between) == 5
+    assert len(out["occurrences"]) == 9
+    assert out["n_captured_unmatched"] == 2
+
+    block = evidence_text(out, "ready")
+    assert "- …and 4 more" in block
+    assert _bullets(block)[0].startswith("- ")
+
+
+# --- HA end-to-end evidence tests ------------------------------------------
+
+
+async def test_preview_card_evidence_is_ready(
+    hass: HomeAssistant,
+    energy_manager: Any,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+) -> None:
+    """A 2-capture preview's menu shows the capture evidence block, both runs marked."""
+    entry, data = await _setup_capture(hass, energy_manager, std_prefs, hass_storage)
+    on_ms, off_ms = data.kettle_runs[-1]
+    first = await _capture_window(hass, start_ms=on_ms - 45_000, end_ms=off_ms + 50_000)
+    sig = first["target"]["id"]
+    await _capture_window(
+        hass,
+        start_ms=on_ms - 45_000,
+        end_ms=off_ms + 50_000,
+        target_type="candidate",
+        target="Kettle",
+    )
+
+    menu = await _open_candidate_menu(hass, entry, sig)
+    block = menu["description_placeholders"]["evidence"]
+    assert block.startswith("**Evidence** (heuristics, not accuracy)")
+    assert "2 runs, 2 captured" in block
+    bullets = _bullets(block)
+    assert len(bullets) == 2
+    assert all(ln.endswith(" (captured)") for ln in bullets)
+    assert EVIDENCE_PENDING_TEXT not in block
+
+
+async def test_learned_candidate_marks_captured_occurrence(
+    hass: HomeAssistant,
+    energy_manager: Any,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+) -> None:
+    """One attached capture marks exactly its occurrence; the stored evidence is untouched."""
+    cand = make_switched_candidate("sig-kettle", "Kettle")
+    entry, data = await _setup_capture(
+        hass, energy_manager, std_prefs, hass_storage, candidates=[cand]
+    )
+    hub = entry.runtime_data
+    on_ms, off_ms = data.kettle_runs[-1]
+    await _capture_window(
+        hass,
+        start_ms=on_ms - 45_000,
+        end_ms=off_ms + 50_000,
+        target_type="candidate",
+        target="sig-kettle",
+    )
+    rise = hub.captures.captured_runs("candidate", "sig-kettle")[0]["rise_ms"]
+
+    live = next(c for c in hub.learning.candidates if c["signature_id"] == "sig-kettle")
+    starts = [rise + 4 * _DAY, rise + 3 * _DAY, rise + 2 * _DAY, rise + 20_000,
+              rise - 1 * _DAY, rise - 2 * _DAY]
+    live["evidence"] = _occ_evidence(starts)
+    stored_before = copy.deepcopy(live["evidence"])
+
+    menu = await _open_candidate_menu(hass, entry, "sig-kettle")
+    block = menu["description_placeholders"]["evidence"]
+    assert "6 runs, 1 captured" in block
+    bullets = _bullets(block)
+    assert bullets[3].endswith(" (captured)")
+    for i in (0, 1, 2, 4):
+        assert not bullets[i].endswith(" (captured)")
+
+    # The overlay works on a copy: the stored evidence dict is unchanged.
+    assert live["evidence"] == stored_before
+    assert all("captured" not in occ for occ in live["evidence"]["occurrences"])
+
+
+async def test_unmatched_capture_is_appended(
+    hass: HomeAssistant,
+    energy_manager: Any,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+) -> None:
+    """A captured rise matching no occurrence is appended as a not-matched bullet."""
+    cand = make_switched_candidate("sig-kettle", "Kettle")
+    entry, data = await _setup_capture(
+        hass, energy_manager, std_prefs, hass_storage, candidates=[cand]
+    )
+    hub = entry.runtime_data
+    on_ms, off_ms = data.kettle_runs[-1]
+    await _capture_window(
+        hass,
+        start_ms=on_ms - 45_000,
+        end_ms=off_ms + 50_000,
+        target_type="candidate",
+        target="sig-kettle",
+    )
+    rise = hub.captures.captured_runs("candidate", "sig-kettle")[0]["rise_ms"]
+    live = next(c for c in hub.learning.candidates if c["signature_id"] == "sig-kettle")
+    live["evidence"] = _occ_evidence([rise - 100 * _DAY, rise - 101 * _DAY])
+
+    menu = await _open_candidate_menu(hass, entry, "sig-kettle")
+    bullets = _bullets(menu["description_placeholders"]["evidence"])
+    appended = [ln for ln in bullets if ln.endswith(" (captured, not matched by the detector)")]
+    assert len(appended) == 1
+    assert bullets[0] == appended[0]
+
+
+async def test_device_evidence_marks_captures(
+    hass: HomeAssistant,
+    energy_manager: Any,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+) -> None:
+    """After confirming a preview, the device evidence marks the captures that resolve to it."""
+    entry, data = await _setup_capture(hass, energy_manager, std_prefs, hass_storage)
+    hub = entry.runtime_data
+    runs = data.kettle_runs[-3:]
+    first = await _capture_window(
+        hass, start_ms=runs[0][0] - 45_000, end_ms=runs[0][1] + 50_000
+    )
+    sig = first["target"]["id"]
+    for on_ms, off_ms in runs[1:]:
+        await _capture_window(
+            hass,
+            start_ms=on_ms - 45_000,
+            end_ms=off_ms + 50_000,
+            target_type="candidate",
+            target="Kettle",
+        )
+
+    await async_confirm_candidate(hass, entry, sig, "Kettle")
+    uuid = await _confirmed_uuid(entry, "Kettle")
+
+    device_runs = hub.captures.captured_runs("device", uuid)
+    assert len(device_runs) == 3
+    hub.learning._device_evidence[uuid] = {
+        **_occ_evidence([r["rise_ms"] for r in device_runs]),
+        "active_v": int(hub.devices.record(uuid)["active_v"]),
+    }
+
+    menu = await _open_device_menu(hass, entry, uuid)
+    block = menu["description_placeholders"]["evidence"]
+    assert "3 runs, 3 captured" in block
+    bullets = _bullets(block)
+    assert len(bullets) == 3
+    assert all(ln.endswith(" (captured)") for ln in bullets)
+
+
+async def test_evidence_with_captures_has_only_fixed_words(
+    hass: HomeAssistant,
+    energy_manager: Any,
+    std_prefs: dict[str, Any],
+    hass_storage: dict[str, Any],
+) -> None:
+    """A capture label never reaches the evidence block (only numbers, dates, fixed words)."""
+    entry, data = await _setup_capture(hass, energy_manager, std_prefs, hass_storage)
+    on_ms, off_ms = data.kettle_runs[-1]
+    label = "*bold* [x](y)"
+    first = await _capture_window(
+        hass, start_ms=on_ms - 45_000, end_ms=off_ms + 50_000, label=label
+    )
+    sig = first["target"]["id"]
+
+    menu = await _open_candidate_menu(hass, entry, sig)
+    block = menu["description_placeholders"]["evidence"]
+    assert "*bold*" not in block
+    assert "[x](y)" not in block
+    assert "\\*" not in block
 
 

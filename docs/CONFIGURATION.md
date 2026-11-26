@@ -10,7 +10,7 @@ PowerGuesser is a Home Assistant custom integration. **It uses no environment va
 | Config entry `data` | LLM endpoint settings: base URL, API key, model, probe profile. Written by the "LLM endpoint" options step after a successful probe. |
 | Config entry `options` | Phase mapping, learning schedule, token/cost caps, name sharing, validation toggle. Written by the other options steps. |
 | Config entry subentries | Confirmed devices (`device` subentries). Devices are created only by confirming a learning candidate under *Configure → Review candidates* — clicking the subentry "Add device" button aborts with the `use_review` reason directing you there. |
-| `/config/.storage/powerguesser.*` | Runtime stores owned by the integration: energy profile, learning state, candidates, consent record, review decisions, plug sessions, device records, shadow/validation data. These are managed by the integration; do not edit them by hand. |
+| `/config/.storage/powerguesser.*` | Runtime stores owned by the integration: energy profile, learning state, candidates, consent record, review decisions, plug sessions, device records, capture records (`powerguesser.captures`), shadow/validation data. These are managed by the integration; do not edit them by hand. |
 | `/config/powerguesser/` | SQLite sample buffer (`buffer.sqlite`), plus the `learning/` working directory with `prepare/` and `validation/` nested inside it. |
 
 Energy dashboard sources (grid / gross power sensors and metered devices) are **not** configured in PowerGuesser at all — they are read automatically from Home Assistant's Energy preferences. Setup aborts with an explanatory message if no usable gross source exists.
@@ -115,3 +115,95 @@ Fixed (non-configurable) limits from `const.py` include: LLM request timeout 600
 ## Per-environment overrides
 
 None. Home Assistant config entries are per-instance: there is no dev/staging/production layering, no `.env` files, and no `NODE_ENV`-style switching. To replicate a setup on another Home Assistant instance, configure the same options in its UI; the stored LLM API key and consent records are per-instance and are never exported. A diagnostics download includes the latest LLM endpoint probe result, with the base URL and the API key **redacted**.
+
+## Guided capture (admin actions)
+
+Besides the options flow, PowerGuesser exposes seven **admin-only** capture actions
+(call them as services, or from *Developer tools → Actions*). They teach the integration one
+real device run without waiting for a learning pass. Captures stay local — no capture data is
+sent to the LLM endpoint in this version (captures join the learning payload only in a later
+version).
+
+| Action | Fields | Purpose |
+| --- | --- | --- |
+| `capture_window` | `start`, `end` (local datetimes), `label`, `target_type`, `target`, `device_id` (optional) | Snap a past window to the run's real rise/fall edges. |
+| `capture_start` | `label`, `target_type`, `target`, `device_id` (optional) | Start a live "on now" capture (one at a time). |
+| `capture_stop` | `capture_id` (optional) | Stop the open live capture; returns at once with state `resolving`, and the result is read with `capture_list`. |
+| `capture_cancel` | `capture_id` (optional) | Cancel an open capture (idempotent on a finished one). |
+| `capture_list` | `capture_id` (optional) | Read every stored capture (or one) with its result, window and resolved target. |
+| `capture_delete` | `capture_id` | Delete a stored capture. |
+| `capture_reassign` | `capture_id`, `target_type`, `target`, `device_id` (optional) | Re-target a capture. |
+
+`start`/`end` are read in the **Home Assistant time zone**. A time in a repeated hour (DST
+fold) is refused with `capture_ambiguous_local_time` and a time in a skipped hour with
+`capture_nonexistent_local_time`; a window can also be refused for `capture_invalid_window`,
+`capture_future_end`, `capture_window_too_long`, `capture_too_short_for_rate`,
+`capture_interval_too_coarse`, `capture_outside_buffer` or `capture_across_gap` (a gap in the
+buffer inside the window). Every refusal names its reason and changes nothing.
+
+`target_type` is one of:
+
+- `new_device` — `target` is the new device's name; PowerGuesser fits a preview from it.
+- `candidate` — `target` is an existing Review candidate's name or **signature id**.
+- `device` — a confirmed device, chosen with the `device_id` device picker or named by its
+  `target` (name or uuid); the result carries a read-only replay check ("would the active
+  version have claimed this run?"). Nothing is written to the device.
+
+Display names can change after an LLM relabel, so automations should address candidates by
+**signature id** (and address a confirmed device by uuid or the device picker).
+
+Each capture result carries a quality **verdict**: `clean` (teaches), `contaminated`,
+`ambiguous`, or `none` (no pair). Only `clean` captures teach a preview.
+
+A capture aimed at a new device or an existing preview appears in Review at once as a preview
+card reading "from N captured examples". Backed by fewer than `CONFIRM_MIN_RUNS` clean runs it
+cannot be confirmed by default; the confirmation form offers **Confirm anyway**, which shows a
+warning, is logged, and is recorded as an attempted override on the decision. The gate never
+blocks reconciliation with the LLM's candidate.
+
+Dismissing a capture-backed preview keeps its captured examples; deleting a capture is the
+separate `capture_delete` action. Captures whose target no longer resolves surface in Review
+with a notice and as a non-fixable `capture_orphans` Repairs issue until they are reassigned or
+deleted.
+
+Captured windows are **excluded from holdout validation**: every capture record carries a
+holdout-exclusion marker from day one, and `run_validation` drops the capture windows from the
+validation metrics. The report's `holdout.excluded_capture` counts the capture windows whose
+padded span overlaps the holdout (`windows` — not every stored capture) and the holdout samples
+removed (`samples`).
+
+### Capture tuning constants
+
+These are **code-level defaults** carried by `CaptureConfig`
+(`engine/capture/constants.py`); they have no options-flow setting and are measured and tuned
+post-ship on the reference install. Values are the shipped defaults:
+
+| Constant | Default | Meaning |
+| --- | --- | --- |
+| `SNAP_MARGIN_S` | 120 | Half-width (s) of the rise/fall search window around the requested instant. |
+| `CONTEXT_BEFORE_S` | 86,400 | Residual context (s) loaded before the window so edge detection sees the learner's neighbourhood. |
+| `CONTEXT_AFTER_S` | 3,600 | Residual context (s) loaded after the window. |
+| `AMBIGUITY_RATIO` | 2.0 | Runner-up score factor above which a result is `ambiguous`. |
+| `INSIDE_EDGE_REL` | 0.25 | Inside-edge contamination threshold as a fraction of the rise. |
+| `MIN_RUN_SAMPLES` | 2 | Fewest plateau samples a snapped run must have. |
+| `GAP_MAX_FLOOR_S` | 150 | Floor (s) of the inside-gap threshold. |
+| `GAP_MAX_SAMPLES` | 5 | Sample-count multiplier of the inside-gap threshold. |
+| `TRACE_MAX_POINTS` | 300 | Most int values kept in a stored trace. |
+| `TRACE_PAD_S` | 300 | Trace padding (s) either side of the snapped run. |
+| `LIVE_RISE_BEFORE_S` | 180 | Live rise search (s) before the press. |
+| `LIVE_RISE_AFTER_S` | 120 | Live rise search (s) after the press. |
+| `LIVE_FALL_BEFORE_S` | 180 | Live fall search (s) before the stop press. |
+| `LIVE_STOP_SETTLE_SAMPLES` | 3 | Settle wait = clamp(this x effective sample interval, min, max). |
+| `LIVE_STOP_SETTLE_MIN_S` | 90 | Minimum settle wait (s). |
+| `LIVE_STOP_SETTLE_MAX_S` | 180 | Maximum settle wait (s). |
+| `LIVE_STOP_MAX_WAIT_S` | 300 | One extension of the still-on wait, then `no_off_edge`. |
+| `LIVE_STILL_ON_FRAC` | 0.7 | "Still on" fraction of the rise. |
+| `PRE_LEVEL_SAMPLES` | 4 | Samples for the still-on pre-level median. |
+| `LIVE_MAX_OPEN_S` | 3,600 | An open live capture auto-expires after this many seconds. |
+| `PREVIEW_W_TOL` | 0.15 | Preview watts tolerance fraction, floored at `threshold_w` / 2. |
+| `PREVIEW_DUR_TOL` | 0.30 | Preview duration tolerance fraction, floored at one grid step. |
+| `CONFIRM_MIN_RUNS` | 3 | Clean runs below which a preview cannot be confirmed by default. |
+| `ANCHOR_TOL_STEPS` | 1.5 | Grid steps within which a capture anchor maps to an episode row. |
+| `HOLDOUT_PAD_STEPS` | 2 | Grid steps each side a holdout window is padded. |
+| `REPLAY_PRE_ROLL_S` | 600 | Pre-roll (s) before the rise for the read-only replay check. |
+| `MAX_CAPTURE_RECORDS` | 200 | Most capture records retained. |

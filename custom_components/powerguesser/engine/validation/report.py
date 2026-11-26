@@ -114,16 +114,32 @@ def _base_report(
     shadow_created: str | None,
     shadow_age_days: float | None,
     shadow_stale: bool | None,
+    excluded_capture: Mapping | None = None,
 ) -> dict[str, Any]:
-    """The fields every report carries, ok or refused alike (D-27)."""
+    """The fields every report carries, ok or refused alike (D-27).
+
+    ``excluded_capture`` (D-05, Plan 08-04) is written into the report's
+    ``holdout`` dict as ``{"windows", "samples"}`` when capture windows were
+    passed; without it the report is byte-identical to before.
+    """
+    holdout: dict[str, Any] = {
+        "start_ms": int(holdout_days_info.get("start_ms", 0) or 0),
+        "end_ms": int(holdout_days_info.get("end_ms", 0) or 0),
+        "days": [
+            dict(d)
+            for d in holdout_days_info.get("days", [])
+            if isinstance(d, Mapping)
+        ],
+    }
+    if excluded_capture is not None:
+        holdout["excluded_capture"] = {
+            "windows": int(excluded_capture.get("windows", 0) or 0),
+            "samples": int(excluded_capture.get("samples", 0) or 0),
+        }
     return {
         "train_cutoff_ms": int(shadow.get("train_cutoff_ms", 0) or 0),
         "usable_days": int(usable_days),
-        "holdout": {
-            "start_ms": int(holdout_days_info.get("start_ms", 0) or 0),
-            "end_ms": int(holdout_days_info.get("end_ms", 0) or 0),
-            "days": [dict(d) for d in holdout_days_info.get("days", []) if isinstance(d, Mapping)],
-        },
+        "holdout": holdout,
         "baseline": _BASELINE_DEFINITION,
         "metrics": dict(_METRICS_DEFINITIONS),
         "shadow_created": shadow_created,
@@ -216,6 +232,7 @@ def assemble_report(
     shadow_stale: bool | None,
     overlap: Mapping | None = None,
     overlap_synthetic: Mapping | None = None,
+    excluded_capture: Mapping | None = None,
 ) -> dict[str, Any]:
     """Build the full run_validation report (the only metrics writer).
 
@@ -229,6 +246,13 @@ def assemble_report(
     ``overlap_synthetic`` the D-28 synthetic-overlap block; both are copied
     verbatim into ok reports only, so a refused report carries neither and the
     synthetic block never reaches devices, classes, refusals or a verdict.
+
+    ``excluded_capture`` (D-05, Plan 08-04) is written into the report's
+    ``holdout`` dict as ``{"windows", "samples"}`` on ok and refused reports
+    alike: ``windows`` counts the capture windows whose padded span overlaps
+    the holdout, not every capture record; ``samples`` counts the holdout
+    samples removed. Without it the report carries no ``excluded_capture`` key
+    and stays byte-identical (REPORT_SCHEMA_VERSION unchanged).
     """
     base = _base_report(
         shadow=shadow,
@@ -237,6 +261,7 @@ def assemble_report(
         shadow_created=shadow_created,
         shadow_age_days=shadow_age_days,
         shadow_stale=shadow_stale,
+        excluded_capture=excluded_capture,
     )
     not_discovered = [
         dict(e) for e in (shadow.get("not_discovered") or []) if isinstance(e, Mapping)

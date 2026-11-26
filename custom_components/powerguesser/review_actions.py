@@ -19,11 +19,14 @@ flow maps back to ``name_invalid`` / ``candidate_gone``.
 """
 
 from collections.abc import Mapping, Sequence
+import copy
+import logging
 from typing import Any
 
 from homeassistant.util import dt as dt_util
 
 from .const import EVIDENCE_MAX_FAILURES, SUBENTRY_TYPE_DEVICE
+from .engine.capture.constants import CONFIRM_MIN_RUNS
 from .engine.learning.evidence import (
     EVIDENCE_VERSION,
     MIN_RHYTHM_RUNS,
@@ -31,6 +34,8 @@ from .engine.learning.evidence import (
 )
 from .learning import CandidateGone
 from .review_store import normalise_name
+
+_LOGGER = logging.getLogger(__name__)
 
 # How many occurrences the Review block lists before the "…and N more" line.
 SHOWN_OCCURRENCES = 5
@@ -82,7 +87,13 @@ def _local_date(ms: int | None) -> str:
 
 
 def _format_occurrence(occurrence: Mapping[str, Any]) -> str:
-    """One bullet: local weekday/date/time, duration, step W and energy."""
+    """One bullet: local weekday/date/time, duration, step W and energy.
+
+    EVID-05: a user-captured occurrence ends with a fixed-word `` (captured)``
+    suffix; an appended captured run the detector did not claim ends with
+    `` (captured, not matched by the detector)``. Only fixed words are added, so
+    the block stays outside ``_escape_markdown``.
+    """
     start_ms = occurrence.get("start_ms")
     when = (
         dt_util.as_local(dt_util.utc_from_timestamp(start_ms / 1000)).strftime(
@@ -95,9 +106,16 @@ def _format_occurrence(occurrence: Mapping[str, Any]) -> str:
     # A missing step reads a bare "n/a" (like duration/energy/profile), never
     # the odd "step +n/a W" (MR !17 note 4918).
     step = "n/a" if step_w is None else f"+{round(float(step_w))} W"
+    suffix = ""
+    if occurrence.get("captured"):
+        suffix = (
+            " (captured, not matched by the detector)"
+            if occurrence.get("detected") is False
+            else " (captured)"
+        )
     return (
         f"- {when}, {format_duration(occurrence.get('dur_s'))}, "
-        f"step {step}, {format_energy_wh(occurrence.get('energy_wh'))}"
+        f"step {step}, {format_energy_wh(occurrence.get('energy_wh'))}{suffix}"
     )
 
 
@@ -260,28 +278,40 @@ def evidence_text(evidence: Any, state: str) -> str:
     tz_name = str(dt_util.get_default_time_zone())
 
     lines = ["**Evidence** (heuristics, not accuracy)", ""]
+    n_captured = int(evidence.get("n_captured") or 0)
+    captured_part = f", {n_captured} captured" if n_captured > 0 else ""
     if n_runs > 0:
         lines.append(
-            f"{n_runs} runs, first {_local_date(evidence.get('first_ms'))}, "
+            f"{n_runs} runs{captured_part}, first {_local_date(evidence.get('first_ms'))}, "
             f"last {_local_date(evidence.get('last_ms'))}, "
             f"{observed} of {n_days} days observed, times in {tz_name}"
         )
     else:
         lines.append(
-            f"0 runs in {observed} of {n_days} days observed, times in {tz_name}"
+            f"0 runs{captured_part} in {observed} of {n_days} days observed, "
+            f"times in {tz_name}"
         )
     lines.append("")
 
     occurrences = list(evidence.get("occurrences") or [])
-    if n_runs == 0 or not occurrences:
+    # The stored occurrences list is capped (MAX_OCCURRENCES), so the tail count
+    # is the true total: detected runs plus captures that matched no detected run
+    # (a captured occurrence whose rise matched a run is already counted in
+    # n_runs). Key the empty branch on the overlaid data instead of n_runs: a
+    # capture-only group (zero detected runs, read-time overlay appending the
+    # captures) must list them, not render "Recent runs: none" (EVID-05).
+    n_total = n_runs + int(evidence.get("n_captured_unmatched") or 0)
+    if not occurrences:
         lines.append("Recent runs: none")
     else:
         lines.append("Recent runs, newest first:")
         lines.append("")
         for occurrence in occurrences[:SHOWN_OCCURRENCES]:
             lines.append(_format_occurrence(occurrence))
-        if n_runs > SHOWN_OCCURRENCES:
-            lines.append(f"- …and {n_runs - SHOWN_OCCURRENCES} more")
+        # EVID-05: the tail count covers every occurrence (detected runs and
+        # appended captured-only runs together) beyond the shown five.
+        if n_total > SHOWN_OCCURRENCES:
+            lines.append(f"- …and {n_total - SHOWN_OCCURRENCES} more")
 
     # One blank line between each remaining section, so Rhythm, Profile and
     # Hints each render on their own line whatever the frontend does with a
@@ -323,6 +353,84 @@ def _resolve_unconfirmed_uuid(hub: Any, cand: Mapping[str, Any]) -> str | None:
     return str(matches[0].get("uuid"))
 
 
+def overlay_captured(
+    evidence: Mapping[str, Any], captured_runs: Sequence[Mapping[str, Any]], step_ms: int
+) -> dict[str, Any]:
+    """Overlay user-captured runs on a stored evidence dict (EVID-05, A9).
+
+    Read-time and pure: a deep copy is returned, so the stored evidence is never
+    mutated. A detected occurrence whose ``start_ms`` is within ``step_ms`` of a
+    captured ``rise_ms`` (inclusive) gains ``captured: True``; several captures
+    of one occurrence mark it once. A captured run matched by no occurrence is
+    appended as ``{start_ms, dur_s, step_w, energy_wh, captured: True,
+    detected: False}``; unmatched captures whose rises lie within ``step_ms`` of
+    an already-appended one are dropped, processing them in the fixed order
+    ``(verdict != "clean", rise_ms, capture_id)`` so the clean capture wins
+    whatever the Store record order. The listed occurrences are re-sorted
+    newest first and ``n_captured``/``n_captured_unmatched`` are set. With an
+    empty ``captured_runs`` the evidence is returned unchanged (no new keys).
+    """
+    if not captured_runs:
+        return evidence
+    out = copy.deepcopy(dict(evidence))
+    occurrences = [dict(occ) for occ in (out.get("occurrences") or [])]
+    step = int(step_ms)
+
+    unmatched: list[Mapping[str, Any]] = []
+    for run in captured_runs:
+        rise = run.get("rise_ms")
+        matched = False
+        if rise is not None:
+            rise_int = int(rise)
+            for occurrence in occurrences:
+                start = occurrence.get("start_ms")
+                if start is not None and abs(int(start) - rise_int) <= step:
+                    occurrence["captured"] = True
+                    matched = True
+                    break
+        if not matched:
+            unmatched.append(run)
+
+    unmatched.sort(
+        key=lambda run: (
+            run.get("verdict") != "clean",
+            int(run.get("rise_ms") or 0),
+            str(run.get("capture_id") or ""),
+        )
+    )
+    appended: list[dict[str, Any]] = []
+    for run in unmatched:
+        rise_int = int(run.get("rise_ms") or 0)
+        if any(abs(rise_int - int(a["start_ms"])) <= step for a in appended):
+            continue
+        appended.append(
+            {
+                "start_ms": rise_int,
+                "dur_s": run.get("dur_s"),
+                "step_w": run.get("step_w"),
+                "energy_wh": run.get("energy_wh"),
+                "captured": True,
+                "detected": False,
+            }
+        )
+
+    occurrences.extend(appended)
+    occurrences.sort(key=lambda occ: occ.get("start_ms") or 0, reverse=True)
+    out["occurrences"] = occurrences
+    out["n_captured"] = sum(1 for occ in occurrences if occ.get("captured"))
+    out["n_captured_unmatched"] = len(appended)
+    return out
+
+
+def _capture_step_ms(captured_runs: Sequence[Mapping[str, Any]]) -> int:
+    """The overlay step for a run list: the first run's grid as milliseconds."""
+    for run in captured_runs:
+        grid_s = run.get("grid_s")
+        if grid_s:
+            return int(round(float(grid_s) * 1000))
+    return 30_000
+
+
 def evidence_view(
     hub: Any, *, cand: Any = None, dev_uuid: str | None = None
 ) -> tuple[Any, str]:
@@ -331,27 +439,48 @@ def evidence_view(
     A ``dev_uuid`` without an active artefact (nothing to replay) is the
     ``none`` state; otherwise the supervisor's stored device evidence (or its
     read-time fallback) decides ready/pending/failed. A ``cand`` that is one of
-    the supervisor's own candidates uses its stored evidence; an
-    unconfirmed-device row is resolved to its record and read as a device, so it
-    never shows the pending text forever. Read-only: it starts no job and writes
-    no Store (D-12).
+    the supervisor's own candidates uses its stored evidence; a capture-origin
+    preview uses its own ``capture`` evidence; an unconfirmed-device row is
+    resolved to its record and read as a device, so it never shows the pending
+    text forever. A ready learned candidate's or device's evidence is overlaid
+    with the captures that resolve to it (EVID-05). Read-only: it starts no job
+    and writes no Store (D-12).
     """
     learning = hub.learning
     data = getattr(getattr(learning, "coordinator", None), "data", None) or {}
     failures = int(data.get("evidence_failures", 0) or 0)
+    captures = getattr(hub, "captures", None)
     if dev_uuid is not None:
         # Comment: the artefact decides "none"; the evidence value never does.
         artefact, _active_v = hub.devices.active_artefact_and_version(dev_uuid)
         if artefact is None:
             return None, "none"
         device_evidence = learning.device_evidence(dev_uuid)
-        return device_evidence, evidence_state(device_evidence, failures)
+        state = evidence_state(device_evidence, failures)
+        if state == "ready" and captures is not None and isinstance(device_evidence, Mapping):
+            captured = captures.captured_runs("device", str(dev_uuid))
+            if captured:
+                device_evidence = overlay_captured(
+                    device_evidence, captured, _capture_step_ms(captured)
+                )
+        return device_evidence, state
     if cand is not None:
         sig_id = str(cand.get("signature_id") or "")
+        if str(cand.get("origin") or "") == "capture":
+            # A capture preview's evidence is built from its own captured runs.
+            preview_evidence = cand.get("evidence")
+            return preview_evidence, evidence_state(preview_evidence, failures)
         own_sigs = {str(c.get("signature_id") or "") for c in learning.candidates}
         if sig_id in own_sigs:
             candidate_evidence = cand.get("evidence")
-            return candidate_evidence, evidence_state(candidate_evidence, failures)
+            state = evidence_state(candidate_evidence, failures)
+            if state == "ready" and captures is not None and isinstance(candidate_evidence, Mapping):
+                captured = captures.captured_runs("candidate", sig_id)
+                if captured:
+                    candidate_evidence = overlay_captured(
+                        candidate_evidence, captured, _capture_step_ms(captured)
+                    )
+            return candidate_evidence, state
         # The row came from devices.unconfirmed_candidates(): it is a device view.
         resolved = _resolve_unconfirmed_uuid(hub, cand)
         if resolved is None:
@@ -391,14 +520,73 @@ def candidate_is_preview(hub: Any, cand: Mapping[str, Any]) -> bool:
     return not bool(validated)
 
 
-async def async_confirm_candidate(
-    hub: Any, cand_id: str | None, raw_name: str
-) -> None:
-    """Confirm a candidate as a device (D-14, behaviour-preserving).
+def captured_runs_phrase(n: int) -> str:
+    """Render a captured-run count as ``1 captured run`` / ``N captured runs`` (D-03).
 
-    Raises ``CandidateGone`` when the candidate is no longer visible and
-    ``InvalidName`` when the name is rejected; both map to the flow's
-    ``candidate_gone`` / ``name_invalid`` errors.
+    The single place this wording is built: the confirm form warning, the
+    override WARNING log line and the ``PreviewNeedsRuns`` message all call it,
+    so the gate cannot show two different counts for the same preview.
+    """
+    count = int(n)
+    if count == 1:
+        return "1 captured run"
+    return f"{count} captured runs"
+
+
+class PreviewNeedsRuns(Exception):
+    """A capture preview backed by fewer than ``CONFIRM_MIN_RUNS`` clean runs (D-03).
+
+    Raised by ``async_confirm_candidate`` unless the caller passes
+    ``override=True``. The options flow maps it to the ``preview_needs_runs``
+    form error and offers the ``confirm_anyway`` override checkbox.
+    """
+
+    def __init__(self, n: int, required: int) -> None:
+        self.n = int(n)
+        self.required = int(required)
+        super().__init__(
+            f"This preview is based on {captured_runs_phrase(self.n)}, "
+            f"fewer than the {self.required} needed to confirm without an "
+            "explicit override"
+        )
+
+
+def capture_gate(cand: Mapping[str, Any]) -> tuple[int, int] | None:
+    """The D-03 confirm gate for a candidate: ``(n, required)`` or None.
+
+    A capture-origin preview backed by fewer clean captured runs than
+    ``CONFIRM_MIN_RUNS`` is gated; every other candidate (a mature preview with
+    enough runs, any learned candidate) returns None. This is the one gate rule:
+    ``async_confirm_candidate`` refuses on it and ``config_flow.async_step_confirm``
+    shows the ``confirm_anyway`` override exactly when it is not None (D-03). The
+    gate lives only on confirm: preview creation, identity priors and
+    reconciliation never consult it.
+    """
+    if str(cand.get("origin") or "") != "capture":
+        return None
+    scores = cand.get("scores") or {}
+    n = int(scores.get("n_examples") or 0)
+    if n < CONFIRM_MIN_RUNS:
+        return (n, CONFIRM_MIN_RUNS)
+    return None
+
+
+async def async_confirm_candidate(
+    hub: Any, cand_id: str | None, raw_name: str, *, override: bool = False
+) -> None:
+    """Confirm a candidate as a device (D-14, D-03 override).
+
+    Raises ``CandidateGone`` when the candidate is no longer visible,
+    ``InvalidName`` when the name is rejected and ``PreviewNeedsRuns`` when a
+    capture preview is backed by fewer than ``CONFIRM_MIN_RUNS`` clean runs and
+    ``override`` is not set.
+
+    On an override the refusal is logged at WARNING and recorded on the review
+    decision through ``ReviewStore.async_record_confirm_override`` *before* the
+    device is created, so the record means "override attempted" (a confirm that
+    then fails keeps the audit entry). A capture preview passes its group's
+    ``created_at`` as ``trained_at``; every other candidate keeps the last
+    learning run's ``candidates_created_at``.
     """
     cand = find_candidate(hub, cand_id)
     if cand is None:
@@ -407,11 +595,34 @@ async def async_confirm_candidate(
         norm_name = normalise_name(raw_name)
     except ValueError as err:
         raise InvalidName(str(err)) from err
+
+    gate = capture_gate(cand)
+    trained_at = hub.learning.candidates_created_at
+    if gate is not None:
+        n, required = gate
+        if not override:
+            raise PreviewNeedsRuns(n, required)
+        _LOGGER.warning(
+            "Confirming capture preview %s with %s (%d of %d required) via override",
+            cand_id,
+            captured_runs_phrase(n),
+            n,
+            required,
+        )
+        await hub.learning.review.async_record_confirm_override(
+            cand_id, n_runs=n, required=required
+        )
+
+    if str(cand.get("origin") or "") == "capture":
+        created_at = (cand.get("provenance") or {}).get("created_at")
+        if created_at:
+            trained_at = str(created_at)
+
     await hub.devices.async_confirm(
         cand,
         norm_name,
         preview=candidate_is_preview(hub, cand),
-        trained_at=hub.learning.candidates_created_at,
+        trained_at=trained_at,
     )
 
 

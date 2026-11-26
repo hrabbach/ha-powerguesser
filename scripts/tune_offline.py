@@ -36,6 +36,13 @@ lag-cap
     Measure the D-03 recognition lag of one or more program artefacts for a
     list of ``PROGRAM_PROMOTE_FRACTION`` values. See ``_cmd_lag_cap``.
 
+capture-snap
+    Measure the Phase 8 snap quality (D-09): per-margin correct / multi / none
+    fractions for kettle-like and long-heavy switched runs under a seeded user
+    timing jitter, the kettle-like rise/duration spread relative to the median,
+    and — with ``--captures`` — the live press-to-edge delay histogram. See
+    ``_cmd_capture_snap``.
+
 Usage (the reference-install run is post-ship, on a copy of the buffer):
 
     cp buffer.sqlite /tmp/pg-buffer.sqlite
@@ -44,6 +51,8 @@ Usage (the reference-install run is post-ship, on a copy of the buffer):
     python scripts/tune_offline.py lag-cap --buffer /tmp/pg-buffer.sqlite --days 7 \
         --artefacts washer_program.json --plug-entity sensor.washer_power \
         --fractions 0.5,1.0,1.5
+    python scripts/tune_offline.py capture-snap --buffer /tmp/pg-buffer.sqlite --days 14 \
+        --captures /tmp/pg-captures.json
 """
 
 from __future__ import annotations
@@ -57,6 +66,7 @@ import json
 import math
 from pathlib import Path
 import sys
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _ENGINE_ROOT = _REPO_ROOT / "custom_components" / "powerguesser"
@@ -67,6 +77,7 @@ import numpy as np  # noqa: E402
 
 from engine.detect.online import OnlineDetector, compile_model  # noqa: E402
 from engine.detect.program import PROGRAM_PROMOTE_MIN_STEPS  # noqa: E402
+from engine.capture import snap as capture_snap  # noqa: E402
 from engine.learning.digest import (  # noqa: E402
     DUR_SCALE,
     RISE_SCALE,
@@ -440,6 +451,160 @@ def _cmd_lag_cap(args: argparse.Namespace) -> dict:
     }
 
 
+def _press_to_edge(captures_path: str) -> dict:
+    """Read live done capture records and return the press-to-edge delay lists.
+
+    Only records with mode "live" and state "done" count; a window record is
+    ignored (its press times are None). ``n`` is the number of live done records.
+    """
+    raw = json.loads(Path(captures_path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        data = raw.get("data")
+        records = (data or {}).get("captures") if isinstance(data, dict) else None
+        if records is None:
+            records = raw.get("captures")
+    else:
+        records = raw
+    rise_s: list[float] = []
+    fall_s: list[float] = []
+    n = 0
+    for record in records or []:
+        if not isinstance(record, Mapping):
+            continue
+        if record.get("mode") != "live" or record.get("state") != "done":
+            continue
+        n += 1
+        result = record.get("result")
+        result = result if isinstance(result, Mapping) else {}
+        press_rise = result.get("press_to_rise_s")
+        press_fall = result.get("press_to_fall_s")
+        if isinstance(press_rise, (int, float)) and not isinstance(press_rise, bool):
+            rise_s.append(float(press_rise))
+        if isinstance(press_fall, (int, float)) and not isinstance(press_fall, bool):
+            fall_s.append(float(press_fall))
+    return {"rise_s": rise_s, "fall_s": fall_s, "n": n}
+
+
+def _cmd_capture_snap(args: argparse.Namespace) -> dict:
+    """Measure the D-09 snap success, tolerance spread and press-to-edge histogram.
+
+    Uses the same window and residual helpers as the other subcommands, builds
+    the episode table with ``worker.build_episode_table`` and takes the switched
+    pairs as truth. For each margin it runs ``engine.capture.snap.select_and_judge``
+    over the same residual with the user's start/end jittered uniformly by
+    ``--jitter-s`` (seeded), so it says what a real user's timing error would do
+    to the snap. It assigns no engine constant and opens the buffer read-only.
+    """
+    grid_s = int(args.grid_s)
+    step_ms = grid_s * 1000
+    start_ms, end_ms, bounds = _window(args.buffer, args.days, grid_s)
+    metered = _metered_channels(args.buffer, args.metered)
+    series = load_residual(str(args.buffer), start_ms, end_ms, step_ms, metered, {})
+    r = np.asarray(series.residual, dtype=np.float64)
+    table, _rle, threshold = build_episode_table(
+        r,
+        series.phases,
+        start_ms,
+        step_ms,
+        bounds,
+        _first_weekday(start_ms),
+        list(DEFAULT_EVENT_TYPES),
+    )
+
+    switched = np.where(table["kind"] == 0)[0]
+    rise_w = table["rise_w"][switched]
+    dur_s = table["dur_s"][switched]
+    rise_ms = start_ms + table["start_i"][switched] * step_ms
+    fall_ms = start_ms + table["end_i"][switched] * step_ms
+
+    kettle_like = np.where((rise_w >= 1500.0) & (rise_w <= 3200.0) & (dur_s <= 300.0))[0]
+    long_heavy = np.where(
+        (rise_w >= 1500.0) & (dur_s > 300.0) & (dur_s <= 1800.0)
+    )[0]
+
+    margins = [int(token) for token in str(args.margins).split(",") if token.strip()]
+    jitter_ms = float(args.jitter_s) * 1000.0
+    rng = np.random.default_rng(int(args.seed))
+
+    def _band(indices: np.ndarray) -> dict:
+        n_runs = int(len(indices))
+        per_margin: dict[str, dict[str, float | int]] = {}
+        for margin in margins:
+            margin_ms = margin * 1000
+            correct = multi = none = 0
+            for k in indices:
+                truth_rise = int(rise_ms[k])
+                truth_fall = int(fall_ms[k])
+                user_start = int(truth_rise + rng.uniform(-jitter_ms, jitter_ms))
+                user_end = int(truth_fall + rng.uniform(-jitter_ms, jitter_ms))
+                outcome = capture_snap.select_and_judge(
+                    r,
+                    start_ms=start_ms,
+                    step_ms=step_ms,
+                    threshold_w=float(threshold),
+                    rise_range_ms=(user_start - margin_ms, user_start + margin_ms),
+                    fall_range_ms=(user_end - margin_ms, user_end + margin_ms),
+                    ref_start_ms=user_start,
+                    ref_end_ms=user_end,
+                    enabled_event_types=list(DEFAULT_EVENT_TYPES),
+                )
+                if outcome["verdict"] == "none":
+                    none += 1
+                    continue
+                row = outcome["row"]
+                chosen_rise = start_ms + int(row["start_i"]) * step_ms
+                chosen_fall = start_ms + int(row["end_i"]) * step_ms
+                if (
+                    abs(chosen_rise - truth_rise) <= step_ms
+                    and abs(chosen_fall - truth_fall) <= step_ms
+                ):
+                    correct += 1
+                if len(outcome["candidates"]) > 1:
+                    multi += 1
+            per_margin[str(margin)] = {
+                "n": n_runs,
+                "correct": round(correct / n_runs, 4) if n_runs else 0.0,
+                "multi": round(multi / n_runs, 4) if n_runs else 0.0,
+                "none": round(none / n_runs, 4) if n_runs else 0.0,
+            }
+        return per_margin
+
+    def _spread(values: np.ndarray) -> dict[str, float | None]:
+        if len(values) == 0:
+            return {"p5": None, "p50": None, "p95": None}
+        median = float(np.median(values))
+        if not math.isfinite(median) or median <= 0.0:
+            return {"p5": None, "p50": None, "p95": None}
+        return {
+            "p5": round(float(np.percentile(values, 5)) / median, 4),
+            "p50": round(float(np.percentile(values, 50)) / median, 4),
+            "p95": round(float(np.percentile(values, 95)) / median, 4),
+        }
+
+    payload: dict[str, Any] = {
+        "subcommand": "capture-snap",
+        "grid_s": grid_s,
+        "days": int(args.days),
+        "metered_channels": metered,
+        "window": {"start_ms": start_ms, "end_ms": end_ms},
+        "threshold_w": round(float(threshold), 1),
+        "jitter_s": float(args.jitter_s),
+        "seed": int(args.seed),
+        "margins": margins,
+        "bands": {
+            "kettle_like": _band(kettle_like),
+            "long_heavy": _band(long_heavy),
+        },
+        "tolerance": {
+            "rise_frac": _spread(rise_w[kettle_like]),
+            "dur_frac": _spread(dur_s[kettle_like]),
+        },
+    }
+    if args.captures:
+        payload["press_to_edge"] = _press_to_edge(str(args.captures))
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The subcommand layout (buffer/days/grid-s shared, metered where it applies)."""
     parser = argparse.ArgumentParser(
@@ -497,6 +662,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_FRACTIONS,
         help=f"comma-separated PROGRAM_PROMOTE_FRACTION values (default {DEFAULT_FRACTIONS})",
     )
+    snap = subparsers.add_parser(
+        "capture-snap", help="D-09 post-ship snap measurement (margins, tolerance, delays)"
+    )
+    add_common(snap, with_metered=True)
+    snap.add_argument(
+        "--margins",
+        default="60,120,180,300",
+        help="comma-separated snap search margins in seconds (default 60,120,180,300)",
+    )
+    snap.add_argument(
+        "--jitter-s",
+        type=float,
+        default=120,
+        help="half-width of the uniform user start/end timing jitter in seconds (default 120)",
+    )
+    snap.add_argument(
+        "--seed",
+        type=int,
+        default=8,
+        help="seed for the jitter draw (default 8)",
+    )
+    snap.add_argument(
+        "--captures",
+        default=None,
+        help=(
+            "optional path to a copy of the powerguesser.captures Store JSON; adds "
+            "the live press-to-edge delay histogram"
+        ),
+    )
     return parser
 
 
@@ -507,6 +701,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = _cmd_session_scaling(args)
     elif args.subcommand == "interval-60s":
         payload = _cmd_interval_60s(args)
+    elif args.subcommand == "capture-snap":
+        payload = _cmd_capture_snap(args)
     else:
         payload = _cmd_lag_cap(args)
     print(json.dumps(payload, sort_keys=True))

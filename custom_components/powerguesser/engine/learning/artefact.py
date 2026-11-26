@@ -209,3 +209,26 @@ class SignatureArtefact:
         if self.kind == "program":
             fingerprint["session_stages"] = stage_fingerprint(self.session)
         return fingerprint
+
+
+def fingerprint_of(d: Mapping[str, object]) -> dict[str, object] | None:
+    """Resolve a candidate-shaped mapping's structural fingerprint (D-01).
+
+    A candidate stored before the Phase 8 fingerprint upgrade still records a
+    real fingerprint on dismiss/rename/merge/confirm. A non-empty ``fingerprint``
+    mapping already on ``d`` is returned as a plain dict copy (a candidate that
+    carries one keeps it unchanged); every other mapping is read as an artefact
+    and its fingerprint computed with :meth:`SignatureArtefact.fingerprint`.
+
+    A mapping that cannot be read as an artefact (a missing required key, a
+    non-sequence or non-mapping ``states`` entry, a malformed box) yields
+    ``None`` instead of raising, so the review path never crashes on a corrupt
+    or legacy record.
+    """
+    stored = d.get("fingerprint")
+    if isinstance(stored, Mapping) and stored:
+        return dict(stored)
+    try:
+        return SignatureArtefact.from_dict(d).fingerprint()
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None

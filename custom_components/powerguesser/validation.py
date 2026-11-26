@@ -234,6 +234,13 @@ class ValidationManager:
 
         validation_time_ms = int(round(dt_util.utcnow().timestamp() * 1000))
 
+        # D-05 (Plan 08-04): read the capture windows on the event loop (the
+        # Store-backed manager is a plain list read here), then pass the plain
+        # [start_ms, end_ms] pairs into the executor closure. Records of every
+        # state keep a holdout window, so all of them count.
+        captures = getattr(self.hub, "captures", None)
+        capture_windows = captures.holdout_windows() if captures is not None else []
+
         def _prepare_job() -> Path:
             stage_dir.mkdir(parents=True, exist_ok=True)
             job = dict(self.hub.learning.build_window_job(stage_dir))
@@ -242,6 +249,8 @@ class ValidationManager:
             job["plug_classes"] = dict(self._plug_classes)
             job["validation_time_ms"] = validation_time_ms
             job["synthetic_overlap"] = bool(synthetic_overlap)
+            if capture_windows:
+                job["capture_windows"] = capture_windows
             job_path = stage_dir / "job_validate.json"
             job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
             return job_path
@@ -401,10 +410,16 @@ class ValidationManager:
                 "others": others,
                 "sessions": sessions,
             }
+            if capture_windows:
+                job["capture_windows"] = capture_windows
             job_path = stage_dir / "job_validate_sessions.json"
             job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
             return job_path
 
+        # D-05 (Plan 08-04): read the capture windows on the event loop before the
+        # executor hop, exactly like the validate job.
+        captures = getattr(self.hub, "captures", None)
+        capture_windows = captures.holdout_windows() if captures is not None else []
         job_path = await self.hass.async_add_executor_job(_prepare_sessions_job)
         if job_path is None:
             return

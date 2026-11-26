@@ -1,8 +1,15 @@
 """Golden snapshot of the extract, compile_score and rescore stage outputs (Plan 04-13).
 
-The snapshot is recorded from the UNCHANGED code and committed before any
-production edit; it is never updated in this plan. Any change in what learning
+The snapshot was recorded from the UNCHANGED code and committed before any
+production edit; it is never updated otherwise. Any change in what learning
 extracts, compiles or scores fails ``test_extract_compile_and_rescore_unchanged_by_refactor``.
+
+Deliberately regenerated exactly ONCE for Phase 8 D-01 (every compile_score
+library dict now carries a ``fingerprint`` key). The regeneration is diff-checked
+by ``test_candidates_without_fingerprint_unchanged``: the golden candidates minus
+the ``fingerprint`` key must still equal the baseline recorded from the unchanged
+compile code, so any change beyond that key fails. Every other part of the golden
+(digest, digest_meta, episodes, rescore) stays byte-identical.
 """
 
 from datetime import datetime, timezone
@@ -143,6 +150,33 @@ def golden_run(tmp_path_factory):
 def test_extract_compile_and_rescore_unchanged_by_refactor(golden_run, snapshot) -> None:
     """The unchanged extract, compile_score and rescore outputs match the golden snapshot."""
     assert golden_run.snapshot_dict == snapshot
+
+
+def test_candidates_without_fingerprint_unchanged(golden_run, snapshot) -> None:
+    """D-01 pre-fingerprint baseline: the golden candidates with the "fingerprint"
+    key removed equal this snapshot, recorded from unchanged compile code before
+    any production edit.
+
+    Phase 8 D-01 stamps a ``fingerprint`` on every compile_score library dict, so
+    ``test_extract_compile_and_rescore_unchanged_by_refactor``'s golden changes by
+    exactly that key. This baseline, recorded first, is what proves the golden diff
+    is only the added ``fingerprint`` key and nothing else.
+    """
+    stripped = [
+        {k: v for k, v in cand.items() if k != "fingerprint"}
+        for cand in _canon(golden_run.candidates)
+    ]
+    assert stripped == snapshot
+
+
+def test_golden_candidates_fingerprint_matches_artefact(golden_run) -> None:
+    """D-01: every golden candidate's "fingerprint" equals SignatureArtefact.from_dict(candidate).fingerprint()."""
+    from custom_components.powerguesser.engine.learning.artefact import SignatureArtefact
+
+    assert golden_run.candidates
+    for cand in golden_run.candidates:
+        assert cand["fingerprint"] == SignatureArtefact.from_dict(cand).fingerprint()
+        assert cand["fingerprint"]["states"]
 
 
 def test_fit_state_boxes_matches_compile_rules() -> None:

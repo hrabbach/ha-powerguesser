@@ -24,6 +24,7 @@ from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import dt as dt_util
 
 from .buffer_writer import BufferWriter
+from .capture import CaptureManager, async_remove_capture_data
 from .const import (
     BUFFER_DIR,
     BUFFER_FILE,
@@ -35,6 +36,13 @@ from .const import (
     PLATFORMS,
     PROFILE_STORE_KEY,
     PROFILE_STORE_VERSION,
+    SERVICE_CAPTURE_LIST,
+    SERVICE_CAPTURE_CANCEL,
+    SERVICE_CAPTURE_DELETE,
+    SERVICE_CAPTURE_REASSIGN,
+    SERVICE_CAPTURE_START,
+    SERVICE_CAPTURE_STOP,
+    SERVICE_CAPTURE_WINDOW,
     SERVICE_LEARN,
     SERVICE_PREVIEW,
     SERVICE_RUN_VALIDATION,
@@ -113,8 +121,192 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         ),
         supports_response=SupportsResponse.ONLY,
     )
-    return True
 
+    async def _async_capture_window_service(call: ServiceCall) -> ServiceResponse:
+        entries = hass.config_entries.async_loaded_entries(DOMAIN)
+        if not entries:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="not_loaded",
+            )
+        entry = entries[0]
+        return await entry.runtime_data.captures.async_capture_window(
+            start=call.data["start"],
+            end=call.data["end"],
+            label=call.data["label"],
+            target_type=call.data["target_type"],
+            target=call.data["target"],
+            device_id=call.data.get("device_id"),
+        )
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_CAPTURE_WINDOW,
+        _async_capture_window_service,
+        schema=vol.Schema(
+            {
+                vol.Required("start"): cv.datetime,
+                vol.Required("end"): cv.datetime,
+                vol.Required("label"): cv.string,
+                vol.Required("target_type"): vol.In(
+                    ["new_device", "candidate", "device"]
+                ),
+                vol.Required("target"): cv.string,
+                vol.Optional("device_id"): cv.string,
+            }
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    async def _async_capture_list_service(call: ServiceCall) -> ServiceResponse:
+        entries = hass.config_entries.async_loaded_entries(DOMAIN)
+        if not entries:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="not_loaded",
+            )
+        entry = entries[0]
+        return {
+            "captures": entry.runtime_data.captures.list_view(
+                call.data.get("capture_id")
+            )
+        }
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_CAPTURE_LIST,
+        _async_capture_list_service,
+        schema=vol.Schema({vol.Optional("capture_id"): cv.string}),
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    async def _async_capture_start_service(call: ServiceCall) -> ServiceResponse:
+        entries = hass.config_entries.async_loaded_entries(DOMAIN)
+        if not entries:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="not_loaded",
+            )
+        entry = entries[0]
+        return await entry.runtime_data.captures.async_start(
+            label=call.data["label"],
+            target_type=call.data["target_type"],
+            target=call.data["target"],
+            device_id=call.data.get("device_id"),
+        )
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_CAPTURE_START,
+        _async_capture_start_service,
+        schema=vol.Schema(
+            {
+                vol.Required("label"): cv.string,
+                vol.Required("target_type"): vol.In(
+                    ["new_device", "candidate", "device"]
+                ),
+                vol.Required("target"): cv.string,
+                vol.Optional("device_id"): cv.string,
+            }
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    async def _async_capture_stop_service(call: ServiceCall) -> ServiceResponse:
+        entries = hass.config_entries.async_loaded_entries(DOMAIN)
+        if not entries:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="not_loaded",
+            )
+        entry = entries[0]
+        return await entry.runtime_data.captures.async_stop(call.data.get("capture_id"))
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_CAPTURE_STOP,
+        _async_capture_stop_service,
+        schema=vol.Schema({vol.Optional("capture_id"): cv.string}),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    async def _async_capture_cancel_service(call: ServiceCall) -> ServiceResponse:
+        entries = hass.config_entries.async_loaded_entries(DOMAIN)
+        if not entries:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="not_loaded",
+            )
+        entry = entries[0]
+        return await entry.runtime_data.captures.async_cancel(
+            call.data.get("capture_id")
+        )
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_CAPTURE_CANCEL,
+        _async_capture_cancel_service,
+        schema=vol.Schema({vol.Optional("capture_id"): cv.string}),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    async def _async_capture_delete_service(call: ServiceCall) -> ServiceResponse:
+        entries = hass.config_entries.async_loaded_entries(DOMAIN)
+        if not entries:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="not_loaded",
+            )
+        entry = entries[0]
+        return await entry.runtime_data.captures.async_delete(call.data["capture_id"])
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_CAPTURE_DELETE,
+        _async_capture_delete_service,
+        schema=vol.Schema({vol.Required("capture_id"): cv.string}),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+
+    async def _async_capture_reassign_service(call: ServiceCall) -> ServiceResponse:
+        entries = hass.config_entries.async_loaded_entries(DOMAIN)
+        if not entries:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="not_loaded",
+            )
+        entry = entries[0]
+        return await entry.runtime_data.captures.async_reassign(
+            call.data["capture_id"],
+            target_type=call.data["target_type"],
+            target=call.data["target"],
+            device_id=call.data.get("device_id"),
+        )
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_CAPTURE_REASSIGN,
+        _async_capture_reassign_service,
+        schema=vol.Schema(
+            {
+                vol.Required("capture_id"): cv.string,
+                vol.Required("target_type"): vol.In(
+                    ["new_device", "candidate", "device"]
+                ),
+                vol.Required("target"): cv.string,
+                vol.Optional("device_id"): cv.string,
+            }
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    return True
 
 def _phase_subset(options: Mapping[str, Any]) -> tuple[Any, Any, Any, bool]:
     """Extract phase mapping subset from options."""
@@ -162,6 +354,8 @@ async def async_setup_entry(
     supervisor = LearningSupervisor(hass, entry, hub)
     await supervisor.async_start()
     hub.learning = supervisor
+    hub.captures = CaptureManager(hass, entry, hub)
+    await hub.captures.async_load()
     # An active plug session resumes after a restart only through a rebuild, and
     # the first rebuild in hub.async_start ran before learning (and therefore
     # the review sessions Store) existed. Request one now so the plug is
@@ -220,6 +414,9 @@ async def async_unload_entry(
         # Flush the device Stores before the hub stops: a pending delay-save
         # of a stale Store instance must never overwrite a reload (Pitfall 5).
         await entry.runtime_data.devices.async_flush()
+        captures = getattr(entry.runtime_data, "captures", None)
+        if captures is not None:
+            await captures.async_unload()
         if getattr(entry.runtime_data, "learning", None) is not None:
             await entry.runtime_data.learning.async_stop()
         await entry.runtime_data.async_stop()
@@ -232,6 +429,7 @@ async def async_remove_entry(
 ) -> None:
     """Remove a PowerGuesser config entry, delete buffer files, and remove profile store."""
     await async_remove_learning_data(hass)
+    await async_remove_capture_data(hass)
     await async_remove_validation_data(hass)
     await async_remove_device_data(hass)
     path = hass.config.path(BUFFER_DIR, BUFFER_FILE)

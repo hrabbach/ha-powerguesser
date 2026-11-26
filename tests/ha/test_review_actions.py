@@ -25,6 +25,7 @@ def _hub(
     validated: bool = True,
     record_decision: Any = None,
     confirm: Any = None,
+    review: Any = None,
 ) -> Any:
     """A minimal hub stub: a learning view and a devices view."""
     learning = SimpleNamespace(
@@ -32,6 +33,8 @@ def _hub(
         candidates_validated=validated,
         candidates_created_at="2026-11-01T00:00:00+00:00",
         async_record_decision=record_decision or AsyncMock(),
+        review=review
+        or SimpleNamespace(async_record_confirm_override=AsyncMock()),
     )
     devices = SimpleNamespace(
         record=lambda uuid: (records or {}).get(uuid),
@@ -158,3 +161,63 @@ async def test_merge_candidate_normalises_a_bare_string() -> None:
     hub = _hub(visible=[{"signature_id": "sig-a"}], record_decision=_decision)
     await review_actions.async_merge_candidate(hub, "sig-a", "sig-b")
     assert calls == [["sig-b"]]
+
+
+def test_gate_rule_and_wording_are_shared() -> None:
+    """One gate rule and one wording: the form, the log and the exception agree.
+
+    ``capture_gate`` is the single rule the backend refuses on and the form
+    shows ``confirm_anyway`` on; ``captured_runs_phrase`` is the single place
+    the singular/plural wording is built. The form-side equivalence
+    (``confirm_anyway`` present exactly when ``capture_gate`` is not None) is
+    exercised through the real options flow in
+    ``tests/ha/test_capture_confirm_gate.py``.
+    """
+
+    def capture_preview(n: int) -> dict[str, Any]:
+        return {
+            "signature_id": "cap_x",
+            "origin": "capture",
+            "scores": {"validated": False, "n_examples": n},
+        }
+
+    assert review_actions.capture_gate(capture_preview(1)) == (1, 3)
+    assert review_actions.capture_gate(capture_preview(2)) == (2, 3)
+    assert review_actions.capture_gate(capture_preview(3)) is None
+    learned = {"signature_id": "sig-a", "scores": {"validated": True, "n_examples": 1}}
+    assert review_actions.capture_gate(learned) is None
+
+    assert review_actions.captured_runs_phrase(1) == "1 captured run"
+    assert review_actions.captured_runs_phrase(2) == "2 captured runs"
+    assert review_actions.captured_runs_phrase(5) == "5 captured runs"
+
+    err = review_actions.PreviewNeedsRuns(2, 3)
+    assert err.n == 2
+    assert err.required == 3
+    assert review_actions.captured_runs_phrase(2) in str(err)
+
+
+async def test_async_confirm_candidate_raises_preview_needs_runs() -> None:
+    """A 2-run capture preview refuses without override and confirms with it."""
+    cand = {
+        "signature_id": "cap_x",
+        "origin": "capture",
+        "kind": "switched",
+        "scores": {"validated": False, "n_examples": 2},
+    }
+    override_mock = AsyncMock()
+    hub = _hub(
+        visible=[cand],
+        review=SimpleNamespace(async_record_confirm_override=override_mock),
+    )
+
+    with pytest.raises(review_actions.PreviewNeedsRuns) as err:
+        await review_actions.async_confirm_candidate(hub, "cap_x", "Kettle")
+    assert err.value.n == 2
+    assert err.value.required == 3
+    hub.devices.async_confirm.assert_not_called()
+    override_mock.assert_not_awaited()
+
+    await review_actions.async_confirm_candidate(hub, "cap_x", "Kettle", override=True)
+    hub.devices.async_confirm.assert_awaited_once()
+    override_mock.assert_awaited_once_with("cap_x", n_runs=2, required=3)

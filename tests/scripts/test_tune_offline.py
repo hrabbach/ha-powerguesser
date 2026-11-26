@@ -449,3 +449,162 @@ def test_lag_cap_counts_runs_cut_by_the_window_edge_as_truncated(
     assert entry["lag_s_max"] is not None
     assert entry["lag_s_max"] <= _stage1_dur_lo() + GRID_S
     assert _sha(buf) == before
+
+
+# --- capture-snap (D-09 post-ship snap measurement, Plan 08-04) -------------
+
+
+def _build_snap_buffer(path: Path) -> None:
+    build_buffer(path, SynthSpec(days=10), END_MS)
+
+
+def test_capture_snap_reports_margins(tmp_path: Path, capsys) -> None:
+    """Per-margin correct/multi/none fractions for both bands; seeded and read-only."""
+    buf = tmp_path / "buf_snap.sqlite"
+    _build_snap_buffer(buf)
+    before = _sha(buf)
+
+    argv = [
+        "capture-snap",
+        "--buffer",
+        str(buf),
+        "--days",
+        "9",
+        "--margins",
+        "60,120",
+        "--jitter-s",
+        "60",
+    ]
+    payload = _run(_load_harness(), argv, capsys)
+
+    assert set(payload["bands"]) >= {"kettle_like", "long_heavy"}
+    kettle = payload["bands"]["kettle_like"]
+    assert set(kettle) == {"60", "120"}
+    for entry in kettle.values():
+        assert set(entry) == {"n", "correct", "multi", "none"}
+        assert 0.0 <= entry["correct"] <= 1.0
+        assert 0.0 <= entry["multi"] <= 1.0
+        assert 0.0 <= entry["none"] <= 1.0
+    assert kettle["120"]["n"] >= 1
+    assert kettle["120"]["correct"] >= 0.98
+
+    # Seeded: two runs print the identical document.
+    payload2 = _run(_load_harness(), argv, capsys)
+    assert payload2 == payload
+    assert _sha(buf) == before
+
+
+def test_capture_snap_tolerance_spread(tmp_path: Path, capsys) -> None:
+    """The kettle-like band carries the rise and duration spread relative to the median."""
+    buf = tmp_path / "buf_snap_tol.sqlite"
+    _build_snap_buffer(buf)
+
+    payload = _run(
+        _load_harness(),
+        [
+            "capture-snap",
+            "--buffer",
+            str(buf),
+            "--days",
+            "9",
+            "--margins",
+            "120",
+            "--jitter-s",
+            "60",
+        ],
+        capsys,
+    )
+
+    tolerance = payload["tolerance"]
+    assert set(tolerance) == {"rise_frac", "dur_frac"}
+    for key in ("rise_frac", "dur_frac"):
+        assert set(tolerance[key]) == {"p5", "p50", "p95"}
+        assert tolerance[key]["p50"] == pytest.approx(1.0, abs=1e-6)
+        assert (
+            tolerance[key]["p5"]
+            <= tolerance[key]["p50"]
+            <= tolerance[key]["p95"]
+        )
+
+
+def test_capture_snap_press_histogram(tmp_path: Path, capsys) -> None:
+    """--captures adds the live press-to-edge delays; window records are ignored."""
+    buf = tmp_path / "buf_snap_hist.sqlite"
+    _build_snap_buffer(buf)
+    captures = tmp_path / "captures.json"
+    captures.write_text(
+        json.dumps(
+            {
+                "data": {
+                    "captures": [
+                        {
+                            "mode": "live",
+                            "state": "done",
+                            "result": {"press_to_rise_s": 30.0, "press_to_fall_s": -15.0},
+                        },
+                        {
+                            "mode": "live",
+                            "state": "done",
+                            "result": {"press_to_rise_s": 45.0, "press_to_fall_s": 10.0},
+                        },
+                        {
+                            "mode": "window",
+                            "state": "done",
+                            "result": {"press_to_rise_s": 999.0, "press_to_fall_s": 999.0},
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = _run(
+        _load_harness(),
+        [
+            "capture-snap",
+            "--buffer",
+            str(buf),
+            "--days",
+            "9",
+            "--margins",
+            "120",
+            "--jitter-s",
+            "60",
+            "--captures",
+            str(captures),
+        ],
+        capsys,
+    )
+
+    press_to_edge = payload["press_to_edge"]
+    assert press_to_edge["n"] == 2
+    assert press_to_edge["rise_s"] == [30.0, 45.0]
+    assert press_to_edge["fall_s"] == [-15.0, 10.0]
+
+
+def test_capture_snap_opens_buffer_read_only(tmp_path: Path, capsys) -> None:
+    """The buffer's bytes and mtime are unchanged after the run."""
+    buf = tmp_path / "buf_snap_ro.sqlite"
+    _build_snap_buffer(buf)
+    before_bytes = buf.read_bytes()
+    before_mtime = buf.stat().st_mtime
+
+    _run(
+        _load_harness(),
+        [
+            "capture-snap",
+            "--buffer",
+            str(buf),
+            "--days",
+            "9",
+            "--margins",
+            "120",
+            "--jitter-s",
+            "60",
+        ],
+        capsys,
+    )
+
+    assert buf.read_bytes() == before_bytes
+    assert buf.stat().st_mtime == before_mtime

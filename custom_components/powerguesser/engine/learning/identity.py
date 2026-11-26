@@ -172,6 +172,39 @@ def _to_artefact(item: SignatureArtefact | Mapping[str, object], sig_id_override
     return SignatureArtefact.from_dict(d)
 
 
+def similar_dismissed(
+    artefact: SignatureArtefact | Mapping[str, object],
+    decisions: Mapping[str, Mapping[str, object]],
+) -> str | None:
+    """The id of a dismissed candidate whose fingerprint the artefact matches (D-07).
+
+    Among the decisions with ``status == "dismissed"`` and a non-empty
+    fingerprint of the artefact's kind, the one with the highest box IoU
+    (``_calc_artefact_box_iou``) at or above ``BOX_IOU_MIN`` wins; ties break by
+    dismissed id ascending. Returns None when nothing matches. Pure: no new
+    constant, no store write. Used by the HA half of D-07 to note a
+    re-captured dismissed shape without suppressing the preview.
+    """
+    art = artefact if isinstance(artefact, SignatureArtefact) else _to_artefact(artefact)
+    best_id: str | None = None
+    best_iou = 0.0
+    for dec_id in sorted(decisions):
+        dec = decisions[dec_id]
+        if dec.get("status") != "dismissed":
+            continue
+        fingerprint = dec.get("fingerprint")
+        if not fingerprint:
+            continue
+        if str(fingerprint.get("kind") or "") != art.kind:
+            continue
+        other = _to_artefact(dec, sig_id_override=dec_id)
+        iou = _calc_artefact_box_iou(art, other)
+        if iou >= BOX_IOU_MIN and (best_id is None or iou > best_iou):
+            best_id = dec_id
+            best_iou = iou
+    return best_id
+
+
 def match_identities(
     new_artefacts: Sequence[SignatureArtefact],
     prior_artefacts: Sequence[SignatureArtefact | Mapping[str, object]],
@@ -179,6 +212,8 @@ def match_identities(
     table: Mapping[str, np.ndarray],
     *,
     owned: Collection[str] = (),
+    anchors: Mapping[str, Collection[int]] | None = None,
+    capture_prior_ids: Collection[str] = (),
 ) -> list[dict[str, object]]:
     """Match new candidate artefacts against prior artefacts and user review decisions.
 
@@ -195,6 +230,23 @@ def match_identities(
     OUT-05 / D-11 / D-27: ``owned`` carries the signature ids (and aliases) of confirmed
     or retired devices. Task 1 only accepts it; Plan 04-09 Task 2 uses it to suppress
     near twins of a confirmed device and to mark non-twin overlaps.
+
+    CAP-09 (Plan 08-08): ``capture_prior_ids`` are capture-origin priors. A candidate
+    pair whose prior is one of them sorts first in the greedy pass, so a capture of a
+    shape the user dismissed earlier reconciles to the capture beside a higher-scoring
+    dismissed twin (D-07) instead of being suppressed. ``anchors`` maps a prior's
+    signature id to the episode rows its captured run snapped to; when it is given, a
+    still-unmatched new artefact and a still-unmatched prior of the same kind are matched
+    when the artefact's own claims (blocks 0, 1 and 2) contain the prior's anchored rows —
+    the containment-anchor pass that reconciles a validation-block capture whose preview
+    boxes over-claim too many train rows to pass the Jaccard gate (RESEARCH Pattern 4).
+    The solo replay of blocks 1 and 2 is exact, not an approximation: score.replay
+    decides claims per artefact by box containment and never removes a claim for a
+    competing artefact, so claiming against the artefact's own claims (the intended
+    semantics: "does this artefact itself claim the user's captured run?", not "does it
+    win that run against the priors?") is independent of the priors — pinned by
+    test_anchor_claims_do_not_depend_on_priors. Absent both keywords, the output is
+    byte-identical to before.
     """
     if not new_artefacts:
         return []
@@ -256,8 +308,18 @@ def match_identities(
                     candidate_pairs.append((iou, new_id, prior_id))
                     pair_details[(new_id, prior_id)] = iou
 
-    # Greedy one-to-one matching: score descending, then (new_id, prior_id) ascending
-    candidate_pairs.sort(key=lambda item: (-item[0], item[1], item[2]))
+    # Greedy one-to-one matching: capture-origin priors first (CAP-09/D-07), then
+    # score descending, then (new_id, prior_id) ascending. Without any capture
+    # prior every key starts with 1, so the order equals today's.
+    capture_prior_set = set(capture_prior_ids)
+    candidate_pairs.sort(
+        key=lambda item: (
+            0 if item[2] in capture_prior_set else 1,
+            -item[0],
+            item[1],
+            item[2],
+        )
+    )
 
     matched_new: dict[str, str] = {}  # new_id -> prior_id
     matched_prior: set[str] = set()
@@ -266,6 +328,58 @@ def match_identities(
         if n_id not in matched_new and p_id not in matched_prior:
             matched_new[n_id] = p_id
             matched_prior.add(p_id)
+
+    # CAP-09 (Plan 08-08): the containment-anchor pass, after the greedy pass and
+    # before the D-19 twin pass. A capture's snapped run is a block-1/2 episode,
+    # but the one-to-one pass decides on block-0 (train) claims only, and a
+    # preview's tolerance boxes over-claim many train rows (Jaccard < JACCARD_MIN).
+    # So a still-unmatched new artefact and a captured prior are matched when the
+    # artefact's OWN claims contain the prior's anchored rows.
+    #
+    # The claims are the union of the block-0 (train) claims from the shared
+    # replay and a SOLO replay of blocks 1 and 2 (a block without rows yields
+    # empty claims). The solo replay is exact, not an approximation: score.replay
+    # decides claims per artefact by box containment and never removes a claim
+    # for a competing artefact, so adding the priors would not change any new
+    # artefact's claims — solo claims are the intended semantics (the anchor asks
+    # whether the artefact itself claims the user's captured run, not whether it
+    # wins that run against priors), pinned by
+    # test_anchor_claims_do_not_depend_on_priors.
+    if anchors:
+        anchor_claims: dict[str, set[int]] = {
+            art.signature_id: set(replay_res.claims.get(art.signature_id, set()))
+            for art in new_artefacts
+        }
+        for block_no in (1, 2):
+            block_res = replay(new_artefacts, table, block=block_no)
+            for art in new_artefacts:
+                anchor_claims[art.signature_id] |= block_res.claims.get(
+                    art.signature_id, set()
+                )
+
+        anchor_pairs: list[tuple[int, str, str]] = []  # (count, new_id, prior_id)
+        for new_art in new_artefacts:
+            new_id = new_art.signature_id
+            if new_id in matched_new:
+                continue
+            new_claims = anchor_claims.get(new_id, set())
+            if not new_claims:
+                continue
+            for prior_art in prior_list:
+                prior_id = prior_art.signature_id
+                if prior_id in matched_prior or prior_art.kind != new_art.kind:
+                    continue
+                anchored_rows = anchors.get(prior_id)
+                if not anchored_rows:
+                    continue
+                count = sum(1 for row in anchored_rows if int(row) in new_claims)
+                if count > 0:
+                    anchor_pairs.append((count, new_id, prior_id))
+        anchor_pairs.sort(key=lambda item: (-item[0], item[1], item[2]))
+        for _count, n_id, p_id in anchor_pairs:
+            if n_id not in matched_new and p_id not in matched_prior:
+                matched_new[n_id] = p_id
+                matched_prior.add(p_id)
 
     # D-19: near-twin suppression of dismissed candidates, reusing the replay claims.
     twin_of: dict[str, str] = {}

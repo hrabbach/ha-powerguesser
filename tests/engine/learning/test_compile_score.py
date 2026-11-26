@@ -10,6 +10,7 @@ from custom_components.powerguesser.engine.learning.artefact import (
     Box,
     SignatureArtefact,
     State,
+    fingerprint_of,
 )
 from custom_components.powerguesser.engine.learning.proposal import parse_proposal
 from custom_components.powerguesser.engine.learning.worker import run_stage
@@ -917,7 +918,7 @@ def test_compile_score_gates_differing_matches_only_with_actives(tmp_path: Path)
 _EVIDENCE_NOW = "2026-11-25T07:00:00+00:00"
 
 
-def _compile_kettle(
+def _compile_kettle_ex(
     tmp_path: Path,
     *,
     name: str,
@@ -925,8 +926,12 @@ def _compile_kettle(
     prior: list[dict] | None = None,
     drop_residual: bool = False,
     run_id: str | None = None,
-) -> tuple[Path, list[dict]]:
-    """Run the extract -> proposal -> compile_score recipe; return (stage_dir, library dicts)."""
+    oven: bool = False,
+) -> tuple[Path, list[dict], dict, dict]:
+    """Run the extract -> proposal -> compile_score recipe.
+
+    Returns (stage_dir, library dicts, compile_score output, extract output).
+    """
     dt = datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc)
     end_ms = int(dt.timestamp() * 1000)
     days = 22
@@ -934,7 +939,7 @@ def _compile_kettle(
 
     buf_path = tmp_path / f"buf_{name}.sqlite"
     stage_dir = tmp_path / f"stage_{name}"
-    build_buffer(buf_path, SynthSpec(days=days), end_ms)
+    build_buffer(buf_path, SynthSpec(days=days, oven=oven), end_ms)
 
     start_dt = datetime.fromtimestamp(day_bounds_ms[0] / 1000.0, tz=timezone.utc)
     first_weekday = start_dt.weekday()
@@ -985,6 +990,27 @@ def _compile_kettle(
     with open(compile_res["library"], "r", encoding="utf-8") as f:
         library = json.load(f)
     assert library
+    return stage_dir, library, compile_res, extract_res
+
+
+def _compile_kettle(
+    tmp_path: Path,
+    *,
+    name: str,
+    job_extra: dict | None = None,
+    prior: list[dict] | None = None,
+    drop_residual: bool = False,
+    run_id: str | None = None,
+) -> tuple[Path, list[dict]]:
+    """Run the extract -> proposal -> compile_score recipe; return (stage_dir, library dicts)."""
+    stage_dir, library, _compile_res, _extract_res = _compile_kettle_ex(
+        tmp_path,
+        name=name,
+        job_extra=job_extra,
+        prior=prior,
+        drop_residual=drop_residual,
+        run_id=run_id,
+    )
     return stage_dir, library
 
 
@@ -1042,15 +1068,80 @@ def test_compile_without_residual_skips_evidence(tmp_path: Path) -> None:
     assert all("evidence" not in d for d in without_library)
 
 
-def test_learned_candidate_has_no_fingerprint_documented_gap(tmp_path: Path) -> None:
-    """D-21 pin: a real compile_score library dict carries no "fingerprint" key.
+def test_learned_candidate_has_fingerprint_d01(tmp_path: Path) -> None:
+    """D-01 (inverted Phase 7 D-21 pin): every compile_score library dict carries a "fingerprint".
 
-    Phase 8 previews want a fingerprint on learned candidates; adding one would
-    change identity and dismiss behaviour, so it stays a documented v1.0 gap
-    whose fix is a Phase 8 prerequisite. This test flips when Phase 8 fixes it.
+    Phase 7 pinned the absence of a fingerprint as a documented gap whose fix is
+    a Phase 8 prerequisite. Phase 8 D-01 fixed it, so this pin is inverted, not
+    deleted: every learned candidate — the shadow library included — now carries
+    "fingerprint" equal to SignatureArtefact.from_dict(d).fingerprint(), with a
+    non-empty states list.
     """
     _, library = _compile_kettle(tmp_path, name="fingerprint")
-    assert all("fingerprint" not in d for d in library)
+    assert library
+    for d in library:
+        assert d["fingerprint"] == SignatureArtefact.from_dict(d).fingerprint()
+        assert d["fingerprint"]["states"]
+
+
+def test_fingerprint_of_prefers_existing_then_computes() -> None:
+    """fingerprint_of (D-01 HA fallback): keep a non-empty stored fingerprint, else compute.
+
+    A candidate that already carries a non-empty "fingerprint" keeps it unchanged
+    (returned as a copy); one without it is read as an artefact and gets the
+    computed fingerprint; a dict that is not an artefact yields None instead of
+    raising, so a corrupt or legacy record never crashes the review path.
+    """
+    artefact: dict[str, object] = {
+        "schema_version": 1,
+        "signature_id": "sig-x",
+        "kind": "switched",
+        "label": "X",
+        "category": "unknown",
+        "extraction": {
+            "grid_s": 30,
+            "edge_threshold_w": 120.0,
+            "merge_samples": 2,
+            "pair_tol": 0.25,
+        },
+        "states": [
+            {
+                "name": "on",
+                "rise_w": {"lo": 1800.0, "p50": 2000.0, "hi": 2200.0},
+                "fall_w": {"lo": -2200.0, "p50": -2000.0, "hi": -1800.0},
+                "dur_s": {"lo": 60.0, "p50": 120.0, "hi": 300.0},
+                "plateau_w": {"lo": 1800.0, "p50": 2000.0, "hi": 2200.0},
+                "phase_share": None,
+            }
+        ],
+        "session": None,
+        "time_prior": {"hour": [1 / 24] * 24, "dow": [1 / 7] * 7},
+        "constraints": {"max_concurrent": 1},
+        "provenance": {},
+        "scores": {},
+    }
+    computed = SignatureArtefact.from_dict(artefact).fingerprint()
+
+    # Absent key -> computed from the artefact.
+    assert fingerprint_of(artefact) == computed
+    # Empty dict -> still computed.
+    assert fingerprint_of({**artefact, "fingerprint": {}}) == computed
+
+    # Non-empty stored fingerprint -> returned unchanged, as a copy.
+    stored: dict[str, object] = {"kind": "switched", "states": [{"kept": True}]}
+    result = fingerprint_of({**artefact, "fingerprint": stored})
+    assert result == stored
+    assert result is not stored  # a copy, so mutating it never touches the candidate
+
+    # Not an artefact -> None instead of raising.
+    assert fingerprint_of({"states": []}) is None  # missing schema_version
+    assert fingerprint_of({"schema_version": 1, "states": 5}) is None  # states is not a sequence
+    assert fingerprint_of({"schema_version": 1, "states": [1]}) is None  # a non-mapping state
+
+    # A corrupt short phase_share sequence (v[1] missing) raises IndexError -> None.
+    short = copy.deepcopy(artefact)
+    short["states"][0]["phase_share"] = {"l1": [0.5], "l2": [0.5], "l3": [0.5]}
+    assert fingerprint_of(short) is None
 
 
 def test_dedup_share_inputs_exact() -> None:
@@ -1081,3 +1172,191 @@ def test_dedup_share_inputs_exact() -> None:
     assert res_partial.per_signature["sig-P"]["unique_wh"] == 2900.0
     assert res_partial.per_signature["sig-K"]["claimed_wh"] == 200.0
     assert res_partial.per_signature["sig-K"]["unique_wh"] == 200.0
+
+
+def test_compile_maps_capture_anchors(tmp_path: Path) -> None:
+    """CAP-09 (Plan 08-08): the compile job maps capture_anchors to episode rows.
+
+    A capture prior (a preview fitted from one validation-block kettle episode)
+    together with the anchor that names that episode's rise/fall must reconcile
+    the learned kettle to the capture id. A second anchor whose rise/fall match
+    no episode is dropped and named in anchors_unmapped. Without the keys the
+    library equals the existing recipe output and the output carries no
+    anchors_unmapped key.
+    """
+    import numpy as np
+
+    from custom_components.powerguesser.engine.capture.preview import fit_preview
+
+    # The reference (existing) recipe: no capture keys at all.
+    ref_dir, ref_lib, ref_out, ref_extract = _compile_kettle_ex(
+        tmp_path, name="ca_ref", run_id="test-ca"
+    )
+    assert "anchors_unmapped" not in ref_out
+    # A plain recipe with the same run_id produces the same library.
+    _plain_dir, plain_lib = _compile_kettle(tmp_path, name="ca_plain", run_id="test-ca")
+    assert plain_lib == ref_lib
+
+    # The reference's own grid and a validation-block switched episode row.
+    with np.load(str(ref_dir / "residual.npz"), allow_pickle=False) as residual:
+        start_ms = int(residual["start_ms"][0])
+        step_ms = int(residual["step_ms"][0])
+    episodes = ref_extract["episodes"]
+    kind = episodes["kind"]
+    block = episodes["block"]
+    val_rows = [
+        i for i in range(len(kind)) if int(kind[i]) == 0 and int(block[i]) == 1
+    ]
+    assert val_rows, "no validation-block switched episode in the synthetic buffer"
+    row = val_rows[0]
+    rise_ms = start_ms + int(episodes["start_i"][row]) * step_ms
+    fall_ms = start_ms + int(episodes["end_i"][row]) * step_ms
+
+    cap_id = "cap_anchor_test"
+    example = {
+        "capture_id": "c1",
+        "features": {
+            "rise_w": float(episodes["rise_w"][row]),
+            "fall_w": float(episodes["fall_w"][row]),
+            "dur_s": float(episodes["dur_s"][row]),
+            "plateau_w": float(episodes["plateau_w"][row]),
+        },
+        "result": {
+            "verdict": "clean",
+            "step_w": float(episodes["rise_w"][row]),
+            "fall_w": float(episodes["fall_w"][row]),
+            "plateau_w": float(episodes["plateau_w"][row]),
+            "dur_s": float(episodes["dur_s"][row]),
+            "threshold_w": 120.0,
+            "grid_s": 30.0,
+            "rise_ms": rise_ms,
+            "fall_ms": fall_ms,
+        },
+    }
+    preview = fit_preview(cap_id, "Kettle", [example])
+    assert preview is not None
+
+    job_extra = {
+        "capture_anchors": [
+            {"signature_id": cap_id, "rise_ms": rise_ms, "fall_ms": fall_ms},
+            # 10^9 ms away from every row: maps to no episode and is dropped.
+            {
+                "signature_id": "cap_none",
+                "rise_ms": rise_ms + 10**9,
+                "fall_ms": fall_ms + 10**9,
+            },
+        ],
+        "capture_prior_ids": [cap_id],
+    }
+    _cap_dir, cap_lib, cap_out, _cap_extract = _compile_kettle_ex(
+        tmp_path,
+        name="ca_cap",
+        prior=[preview],
+        job_extra=job_extra,
+        run_id="test-ca",
+    )
+
+    assert any(d["signature_id"] == cap_id for d in cap_lib), [
+        d["signature_id"] for d in cap_lib
+    ]
+    assert cap_out["anchors_unmapped"] == ["cap_none"]
+
+
+def test_compile_unions_capture_anchors_per_signature(tmp_path: Path) -> None:
+    """Two captures for one signature union their anchored rows (CAP-09).
+
+    A preview group can hold several captures of the same signature; each maps to
+    its own episode rows. If the mapper overwrote (last anchor wins), a group
+    whose last anchor maps to a row the learned artefact does not claim would stop
+    reconciling; unioning the rows per signature keeps the overlap.
+    """
+    import numpy as np
+
+    from custom_components.powerguesser.engine.capture.preview import fit_preview
+
+    ref_dir, _ref_lib, _ref_out, ref_extract = _compile_kettle_ex(
+        tmp_path, name="cu_ref", run_id="test-cu", oven=True
+    )
+    with np.load(str(ref_dir / "residual.npz"), allow_pickle=False) as residual:
+        start_ms = int(residual["start_ms"][0])
+        step_ms = int(residual["step_ms"][0])
+    episodes = ref_extract["episodes"]
+    kind = episodes["kind"]
+    block = episodes["block"]
+    dur_s = episodes["dur_s"]
+
+    val_rows = [i for i in range(len(kind)) if int(kind[i]) == 0 and int(block[i]) == 1]
+    assert len(val_rows) >= 2, "need a kettle and an oven validation episode"
+
+    def _rise_fall(row: int) -> tuple[int, int]:
+        return (
+            start_ms + int(episodes["start_i"][row]) * step_ms,
+            start_ms + int(episodes["end_i"][row]) * step_ms,
+        )
+
+    # The first validation episode is a morning kettle run; the cycling oven's
+    # preheat episode is the longest one. (A naive shortest-episode pick lands on
+    # a short oven sub-episode, which the kettle never claims.)
+    kettle_row = val_rows[0]
+    oven_row = max(val_rows, key=lambda i: float(dur_s[i]))
+    assert kettle_row != oven_row
+
+    def _example(row: int) -> dict:
+        return {
+            "capture_id": f"c{row}",
+            "features": {
+                "rise_w": float(episodes["rise_w"][row]),
+                "fall_w": float(episodes["fall_w"][row]),
+                "dur_s": float(episodes["dur_s"][row]),
+                "plateau_w": float(episodes["plateau_w"][row]),
+            },
+            "result": {
+                "verdict": "clean",
+                "step_w": float(episodes["rise_w"][row]),
+                "fall_w": float(episodes["fall_w"][row]),
+                "plateau_w": float(episodes["plateau_w"][row]),
+                "dur_s": float(episodes["dur_s"][row]),
+                "threshold_w": 120.0,
+                "grid_s": 30.0,
+                "rise_ms": _rise_fall(row)[0],
+                "fall_ms": _rise_fall(row)[1],
+            },
+        }
+
+    cap_id = "cap_union_test"
+    # Fit the capture preview from the OVEN shape, so the ordinary one-to-one pass
+    # cannot reconcile it with the learned kettle: only the containment-anchor pass
+    # (a claimed anchored row) can.
+    preview = fit_preview(cap_id, "Kettle", [_example(oven_row)])
+    assert preview is not None
+
+    def _anchor(row: int) -> dict:
+        rise_ms, fall_ms = _rise_fall(row)
+        return {"signature_id": cap_id, "rise_ms": rise_ms, "fall_ms": fall_ms}
+
+    def _run(name: str, anchors: list[dict]) -> tuple[list[dict], dict]:
+        _d, lib, out, _e = _compile_kettle_ex(
+            tmp_path,
+            name=name,
+            prior=[preview],
+            job_extra={"capture_anchors": anchors, "capture_prior_ids": [cap_id]},
+            run_id="test-cu",
+            oven=True,
+        )
+        return lib, out
+
+    # Control 1: the kettle row alone reconciles the kettle via the anchor pass.
+    k_lib, _k_out = _run("cu_k", [_anchor(kettle_row)])
+    assert any(d["signature_id"] == cap_id for d in k_lib)
+
+    # Control 2: the oven row alone maps to a real row (not unmapped) but does not
+    # overlap the kettle artefact's claims, so nothing reconciles.
+    o_lib, o_out = _run("cu_o", [_anchor(oven_row)])
+    assert not any(d["signature_id"] == cap_id for d in o_lib)
+    assert o_out["anchors_unmapped"] == []
+
+    # Union with the oven anchor LAST: an overwrite (last wins) would drop the
+    # kettle rows and stop reconciling; the union keeps them.
+    u_lib, u_out = _run("cu_u", [_anchor(kettle_row), _anchor(oven_row)])
+    assert any(d["signature_id"] == cap_id for d in u_lib)
+    assert u_out["anchors_unmapped"] == []

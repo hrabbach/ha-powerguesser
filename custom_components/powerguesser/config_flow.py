@@ -1076,8 +1076,17 @@ class PowerGuesserOptionsFlow(OptionsFlow):
         if hub is None or getattr(hub, "learning", None) is None:
             return self.async_abort(reason="not_loaded")
 
+        captures = getattr(hub, "captures", None)
+        orphan_count = len(captures.orphans()) if captures is not None else 0
         entries = hub.learning.review_entries()
         if not entries:
+            # D-06 (owner Q6): an orphan-only state aborts with the count and the
+            # locked wording, instead of the plain no_candidates abort.
+            if orphan_count > 0:
+                return self.async_abort(
+                    reason="orphan_captures",
+                    description_placeholders={"count": str(orphan_count)},
+                )
             return self.async_abort(reason="no_candidates")
 
         errors: dict[str, str] = {}
@@ -1123,10 +1132,19 @@ class PowerGuesserOptionsFlow(OptionsFlow):
                 ),
             }
         )
+        captures_notice = (
+            ""
+            if orphan_count == 0
+            else (
+                "\n\n**Captured runs without a target:** "
+                f"{orphan_count} captured run(s): target no longer exists: reassign or delete them with the PowerGuesser capture actions."
+            )
+        )
         return self.async_show_form(
             step_id="review",
             data_schema=schema,
             errors=errors,
+            description_placeholders={"captures_notice": captures_notice},
         )
 
     def _device_entry(self, hub: Any, dev_uuid: str | None) -> dict[str, Any] | None:
@@ -1355,20 +1373,26 @@ class PowerGuesserOptionsFlow(OptionsFlow):
             self._review_errors = {"base": "candidate_gone"}
             return await self.async_step_review()
 
-        scores = cand.get("scores") or {}
-        validated = scores.get("validated")
-        if validated is None:
-            validated = hub.learning.candidates_validated
-        preview = not bool(validated)
+        # One preview rule and one gate rule, shared with the backend (D-03):
+        # the form cannot disagree with review_actions.async_confirm_candidate.
+        preview = review_actions.candidate_is_preview(hub, cand)
+        gate = review_actions.capture_gate(cand)
         label = hub.learning.candidate_label(cand)
 
         errors: dict[str, str] = {}
         if user_input is not None:
             raw_name = str(user_input.get("name", ""))
             try:
-                await review_actions.async_confirm_candidate(hub, cand_id, raw_name)
+                await review_actions.async_confirm_candidate(
+                    hub,
+                    cand_id,
+                    raw_name,
+                    override=bool(user_input.get("confirm_anyway")),
+                )
             except review_actions.InvalidName:
                 errors["base"] = "name_invalid"
+            except review_actions.PreviewNeedsRuns:
+                errors["base"] = "preview_needs_runs"
             except CandidateGone:
                 self._review_errors = {"base": "candidate_gone"}
                 return await self.async_step_review()
@@ -1381,18 +1405,30 @@ class PowerGuesserOptionsFlow(OptionsFlow):
             or cand.get("label")
             or ""
         )
-        warning = (
-            ""
-            if not preview
-            else "\n\n**Unvalidated:** this candidate is based on less than 21 days "
-            "of data. Its estimates are provisional."
-        )
-        schema = vol.Schema(
-            {
-                vol.Required("name"): selector.TextSelector(),
-            }
-        )
-        suggested = {"name": current_name}
+        if gate is not None:
+            n, required = gate
+            warning = (
+                "\n\n**Preview from captures:** based on "
+                f"{review_actions.captured_runs_phrase(n)}; confirming needs at "
+                f"least {required} or the Confirm anyway option."
+            )
+        elif preview:
+            warning = (
+                "\n\n**Unvalidated:** this candidate is based on less than 21 days "
+                "of data. Its estimates are provisional."
+            )
+        else:
+            warning = ""
+        schema_fields: dict[Any, Any] = {
+            vol.Required("name"): selector.TextSelector(),
+        }
+        suggested: dict[str, Any] = {"name": current_name}
+        if gate is not None:
+            schema_fields[
+                vol.Optional("confirm_anyway", default=False)
+            ] = selector.BooleanSelector()
+            suggested["confirm_anyway"] = False
+        schema = vol.Schema(schema_fields)
         return self.async_show_form(
             step_id="confirm",
             data_schema=self.add_suggested_values_to_schema(schema, suggested),

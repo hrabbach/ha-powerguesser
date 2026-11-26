@@ -1,4 +1,117 @@
 # serializer version: 1
+# name: test_candidates_without_fingerprint_unchanged
+  list([
+    dict({
+      'category': 'kettle',
+      'constraints': dict({
+        'max_concurrent': 1,
+      }),
+      'extraction': dict({
+        'edge_threshold_w': 120.0,
+        'grid_s': 30,
+        'merge_samples': 2,
+        'pair_tol': 0.25,
+      }),
+      'identity': dict({
+        'matched': None,
+        'merged_into': None,
+        'status': 'new',
+        'twin_of': None,
+      }),
+      'kind': 'switched',
+      'label': 'Kettle',
+      'provenance': dict({
+        'device_ref': 'd1',
+        'input_digest': 'b4bcea5f696060a3ce48e28be0ea95b2abfe41d144c3aa36e6ea6cd759708041',
+        'member_clusters': list([
+          'c04',
+        ]),
+        'model': 'golden-model',
+        'prompt_version': 2,
+        'reference_plug': '',
+        'round': 1,
+        'run_id': 'golden-run',
+      }),
+      'schema_version': 1,
+      'scores': dict({
+        'conflicts': 0,
+        'train': dict({
+          'n': 25,
+          'share': 0.035,
+        }),
+        'val': None,
+        'validated': False,
+        'validation_basis': None,
+        'validation_error_pct': None,
+      }),
+      'session': None,
+      'signature_id': 'dad4c09138a197981ddd68e7a7a5603f',
+      'states': list([
+        dict({
+          'dur_s': dict({
+            'hi': 220.5,
+            'lo': 142.5,
+            'p50': 180.0,
+          }),
+          'fall_w': dict({
+            'hi': -1894.5,
+            'lo': -2105.0,
+            'p50': -2000.0,
+          }),
+          'name': 'heat',
+          'phase_share': None,
+          'plateau_w': dict({
+            'hi': 2103.2,
+            'lo': 1893.8,
+            'p50': 1999.0,
+          }),
+          'rise_w': dict({
+            'hi': 2105.2,
+            'lo': 1891.6,
+            'p50': 1999.0,
+          }),
+        }),
+      ]),
+      'time_prior': dict({
+        'dow': list([
+          0.1875,
+          0.0938,
+          0.125,
+          0.125,
+          0.125,
+          0.125,
+          0.2188,
+        ]),
+        'hour': list([
+          0.0204,
+          0.0204,
+          0.0204,
+          0.0204,
+          0.0204,
+          0.0204,
+          0.0612,
+          0.0816,
+          0.1429,
+          0.0612,
+          0.0204,
+          0.0204,
+          0.0204,
+          0.0204,
+          0.0204,
+          0.0204,
+          0.0204,
+          0.0816,
+          0.0612,
+          0.102,
+          0.0816,
+          0.0204,
+          0.0204,
+          0.0204,
+        ]),
+      }),
+    }),
+  ])
+# ---
 # name: test_extract_compile_and_rescore_unchanged_by_refactor
   dict({
     'candidates': list([
@@ -12,6 +125,34 @@
           'grid_s': 30,
           'merge_samples': 2,
           'pair_tol': 0.25,
+        }),
+        'fingerprint': dict({
+          'kind': 'switched',
+          'states': list([
+            dict({
+              'dur_s': dict({
+                'hi': 220.5,
+                'lo': 142.5,
+                'p50': 180.0,
+              }),
+              'fall_w': dict({
+                'hi': -1894.5,
+                'lo': -2105.0,
+                'p50': -2000.0,
+              }),
+              'phase_share': None,
+              'plateau_w': dict({
+                'hi': 2103.2,
+                'lo': 1893.8,
+                'p50': 1999.0,
+              }),
+              'rise_w': dict({
+                'hi': 2105.2,
+                'lo': 1891.6,
+                'p50': 1999.0,
+              }),
+            }),
+          ]),
         }),
         'identity': dict({
           'matched': None,

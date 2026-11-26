@@ -423,6 +423,30 @@ class ReviewStore:
         self._decisions[sig_id] = {**rec, "fingerprint": dict(fingerprint or {})}
         await self._store.async_save({"decisions": self._decisions})
 
+    async def async_record_confirm_override(
+        self, sig_id: str, *, n_runs: int, required: int
+    ) -> None:
+        """Record a D-03 confirm override on a candidate's decision, and save.
+
+        Key-preserving ({**rec}): the decision keeps every other key (name,
+        status, fingerprint, ...); a decision record that does not exist yet
+        starts empty. The record is written *before* ``devices.async_confirm``
+        runs, so ``confirm_override`` means "override attempted": a confirm that
+        then fails (for example an adopted subentry conflict) leaves the audit
+        entry on a candidate that stays unconfirmed, which is intended — the
+        user did choose to override the gate.
+        """
+        rec = self._decisions.get(sig_id, {})
+        self._decisions[sig_id] = {
+            **rec,
+            "confirm_override": {
+                "at": dt_util.utcnow().isoformat(),
+                "n_runs": int(n_runs),
+                "required": int(required),
+            },
+        }
+        await self._store.async_save({"decisions": self._decisions})
+
     async def async_merge(
         self,
         target_id: str,

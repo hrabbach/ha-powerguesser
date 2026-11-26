@@ -15,3 +15,157 @@ run_validation:
       default: false
       selector:
         boolean:
+capture_window:
+  name: Capture a window
+  description: Snaps a past start/end window to the real rise and fall edges of a device run, stores the capture and returns it. Captures stay local and appear in Review as a preview candidate.
+  fields:
+    start:
+      name: Start
+      description: The local start time of the run (interpreted in the Home Assistant time zone).
+      required: true
+      selector:
+        datetime:
+    end:
+      name: End
+      description: The local end time of the run.
+      required: true
+      selector:
+        datetime:
+    label:
+      name: Label
+      description: A short label for this capture.
+      required: true
+      selector:
+        text:
+    target_type:
+      name: Target type
+      description: "What the capture teaches: a new device, an existing Review candidate, or a confirmed device."
+      required: true
+      selector:
+        select:
+          translation_key: capture_target_type
+          options:
+            - new_device
+            - candidate
+            - device
+    target:
+      name: Target
+      description: A new device's name; a candidate's name or signature id; a confirmed device's name or uuid when no device is picked.
+      required: true
+      selector:
+        text:
+    device_id:
+      name: Device
+      description: Pick a confirmed PowerGuesser device (a shortcut for a device name or uuid target).
+      required: false
+      selector:
+        device:
+          integration: powerguesser
+capture_list:
+  name: List captures
+  description: Returns every stored capture (or the one named by capture_id) with its result block, the interpreted window and its read-time resolved target.
+  fields:
+    capture_id:
+      name: Capture ID
+      description: Return only this capture. Omit to return every capture.
+      required: false
+      selector:
+        text:
+capture_start:
+  name: Start a live capture
+  description: Starts a live capture ("on now"). Stop it with capture_stop; read the result with capture_list. Only one capture can be open at a time.
+  fields:
+    label:
+      name: Label
+      description: A short label for this capture.
+      required: true
+      selector:
+        text:
+    target_type:
+      name: Target type
+      description: "What the capture teaches: a new device, an existing Review candidate, or a confirmed device."
+      required: true
+      selector:
+        select:
+          translation_key: capture_target_type
+          options:
+            - new_device
+            - candidate
+            - device
+    target:
+      name: Target
+      description: A new device's name; a candidate's name or signature id; a confirmed device's name or uuid when no device is picked.
+      required: true
+      selector:
+        text:
+    device_id:
+      name: Device
+      description: Pick a confirmed PowerGuesser device (a shortcut for a device name or uuid target).
+      required: false
+      selector:
+        device:
+          integration: powerguesser
+capture_stop:
+  name: Stop a live capture
+  description: Stops the open live capture and returns at once with state resolving. The snapped result appears after the settle wait in capture_list and Review.
+  fields:
+    capture_id:
+      name: Capture ID
+      description: Stop this capture. Omit to stop the one open capture.
+      required: false
+      selector:
+        text:
+capture_cancel:
+  name: Cancel a capture
+  description: Cancels an open capture. Idempotent on a finished capture.
+  fields:
+    capture_id:
+      name: Capture ID
+      description: Cancel this capture. Omit to cancel the one open capture.
+      required: false
+      selector:
+        text:
+capture_delete:
+  name: Delete a capture
+  description: Deletes a stored capture and returns whether its preview card was removed. Idempotent on an id that no longer exists.
+  fields:
+    capture_id:
+      name: Capture ID
+      description: Delete this capture.
+      required: true
+      selector:
+        text:
+capture_reassign:
+  name: Re-assign a capture
+  description: Moves a capture to a new target. The only action that rewrites a capture's target; a device target recomputes its read-only replay check.
+  fields:
+    capture_id:
+      name: Capture ID
+      description: Re-assign this capture.
+      required: true
+      selector:
+        text:
+    target_type:
+      name: Target type
+      description: "What the capture teaches: a new device, an existing Review candidate, or a confirmed device."
+      required: true
+      selector:
+        select:
+          translation_key: capture_target_type
+          options:
+            - new_device
+            - candidate
+            - device
+    target:
+      name: Target
+      description: A new device's name; a candidate's name or signature id; a confirmed device's name or uuid when no device is picked.
+      required: true
+      selector:
+        text:
+    device_id:
+      name: Device
+      description: Pick a confirmed PowerGuesser device (a shortcut for a device name or uuid target).
+      required: false
+      selector:
+        device:
+          integration: powerguesser

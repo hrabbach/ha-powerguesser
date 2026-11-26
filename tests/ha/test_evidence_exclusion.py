@@ -60,6 +60,10 @@ async def test_confirm_strips_evidence_and_origin(
     cand = make_switched_candidate("sig-kettle", "Kettle")
     cand["evidence"] = {"v": 1, "n_runs": 9}
     cand["origin"] = "capture"
+    # A capture preview mature enough to confirm without the D-03 override
+    # (CONFIRM_MIN_RUNS = 3); the D-13 strip assertion below is what this test
+    # exercises, the confirm gate is covered by the capture confirm-gate tests.
+    cand["scores"]["n_examples"] = 3
     entry = await _setup(hass, energy_manager, std_prefs, hass_storage, [cand])
 
     await async_confirm_candidate(hass, entry, "sig-kettle", "Kettle")

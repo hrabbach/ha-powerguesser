@@ -16,13 +16,21 @@ from typing import Any
 import numpy as np
 import pytest
 
+from custom_components.powerguesser.engine.capture.constants import HOLDOUT_PAD_STEPS
+from custom_components.powerguesser.engine.capture.exclusion import (
+    holdout_exclusion_mask,
+)
 from custom_components.powerguesser.engine.detect.replay import replay_online
+from custom_components.powerguesser.engine.learning.digest import canonical_json
 from custom_components.powerguesser.engine.learning.series import load_residual
 from custom_components.powerguesser.engine.learning.split import (
     calendar_holdout_start,
     data_days,
 )
-from custom_components.powerguesser.engine.learning.worker import run_stage
+from custom_components.powerguesser.engine.learning.worker import (
+    measurable_artefacts,
+    run_stage,
+)
 from custom_components.powerguesser.engine.validation.constants import (
     CLASS_MAX_MEDIAN_PCT,
     CLASS_MAX_PEER_PCT,
@@ -856,4 +864,226 @@ def test_validate_sessions_empty_without_sessions(tmp_path: Path) -> None:
     out = run_stage("validate_sessions", job)
     assert out["n"] == 0
     assert _read_sessions(job) == []
+
+
+# --- Plan 08-04 (D-05): capture windows are dropped from every holdout metric ---
+
+
+def _find_kettle_run_ms(
+    buf_path: Path, channel: int, lo_ms: int, hi_ms: int
+) -> tuple[int, int] | None:
+    """Return the first contiguous ON (>= 1500 W) block's (start_ms, end_ms)."""
+    with sqlite3.connect(str(buf_path)) as conn:
+        rows = conn.execute(
+            "SELECT ts, w FROM samples WHERE ch = ? AND ts >= ? AND ts < ? ORDER BY ts",
+            (channel, lo_ms, hi_ms),
+        ).fetchall()
+    start: int | None = None
+    end: int | None = None
+    for ts, w in rows:
+        if w is not None and w >= 1500:
+            if start is None:
+                start = int(ts)
+            end = int(ts)
+        elif start is not None:
+            return start, end if end is not None else start
+    if start is not None:
+        return start, end if end is not None else start
+    return None
+
+
+def _holdout_masks(job: dict[str, Any]):
+    """Recompute the stage's holdout grid/masks from the job's buffer (without cap)."""
+    day_bounds_ms = job["day_bounds_ms"]
+    start_ms = int(day_bounds_ms[0])
+    end_ms = int(day_bounds_ms[-1])
+    step_ms = GRID_S * 1000
+    kettle_ch = int(job["shadow"]["links"][0]["channel"])
+    series = load_residual(str(job["buffer_path"]), start_ms, end_ms, step_ms, [kettle_ch], {})
+    r = series.gross
+    y = series.plugs[kettle_ch]
+    valid = data_days(r, start_ms, step_ms, day_bounds_ms)
+    n_days = len(day_bounds_ms) - 1
+    first_holdout = calendar_holdout_start(n_days, 7)
+    train_cutoff_ms = int(job["shadow"]["train_cutoff_ms"])
+    valid_set = set(valid)
+    holdout_idx = [
+        d
+        for d in range(first_holdout, n_days)
+        if d in valid_set and int(day_bounds_ms[d]) >= train_cutoff_ms
+    ]
+    holdout_set = set(holdout_idx)
+    bounds = np.array(day_bounds_ms, dtype=np.int64)
+    grid_ts = start_ms + np.arange(len(r), dtype=np.int64) * step_ms
+    sample_day = np.searchsorted(bounds, grid_ts, side="right") - 1
+    holdout_mask = np.isin(sample_day, list(holdout_set))
+    return series, r, y, holdout_mask, grid_ts
+
+
+def _kettle_capture_window(job: dict[str, Any]) -> list[int]:
+    """A short capture window covering the start of a holdout kettle run."""
+    day_bounds_ms = job["day_bounds_ms"]
+    n_days = len(day_bounds_ms) - 1
+    first_holdout = calendar_holdout_start(n_days, 7)
+    kettle_ch = int(job["shadow"]["links"][0]["channel"])
+    run = _find_kettle_run_ms(
+        Path(job["buffer_path"]), kettle_ch, day_bounds_ms[first_holdout], day_bounds_ms[-1]
+    )
+    assert run is not None, "no kettle run in the holdout to capture"
+    on_ms, _off_ms = run
+    return [on_ms, on_ms + 2 * GRID_S * 1000]
+
+
+def test_validate_excludes_capture_windows(tmp_path: Path) -> None:
+    """A capture window over a holdout kettle run drops the event and reports the count."""
+    job, _buf = _validate_job(tmp_path, "excl")
+    window = _kettle_capture_window(job)
+    job["capture_windows"] = [window]
+
+    with_report = run_stage("validate", job)
+    job_without, _buf2 = _validate_job(tmp_path, "excl_plain")
+    without_report = run_stage("validate", job_without)
+
+    assert with_report["status"] == "ok"
+    excluded = with_report["holdout"]["excluded_capture"]
+    assert excluded["windows"] == 1
+    assert excluded["samples"] > 0
+    assert "excluded_capture" not in without_report["holdout"]
+
+    with_kettle = next(d for d in with_report["devices"] if d["entity_id"] == ENTITY_KETTLE)
+    without_kettle = next(
+        d for d in without_report["devices"] if d["entity_id"] == ENTITY_KETTLE
+    )
+    assert with_kettle["n_events"] == without_kettle["n_events"] - 1
+    assert with_kettle["energy_true_wh"] < without_kettle["energy_true_wh"]
+
+
+def test_validate_without_capture_windows_is_byte_identical(tmp_path: Path) -> None:
+    """No key and an empty list both leave the report byte-identical and key-free."""
+    job, _buf = _validate_job(tmp_path, "ident")
+    report_no_key = run_stage("validate", job)
+    job_empty = {
+        **job,
+        "stage_dir": str(tmp_path / "stage_ident_empty"),
+        "capture_windows": [],
+    }
+    report_empty = run_stage("validate", job_empty)
+
+    assert canonical_json(report_no_key) == canonical_json(report_empty)
+    assert b"excluded_capture" not in canonical_json(report_no_key)
+    assert "excluded_capture" not in report_no_key["holdout"]
+
+
+def test_validate_does_not_mask_the_replayed_residual(tmp_path: Path) -> None:
+    """The replay runs on the un-masked residual; only the metric mask loses samples."""
+    job, _buf = _validate_job(tmp_path, "resid")
+    window = _kettle_capture_window(job)
+    job["capture_windows"] = [window]
+    report = run_stage("validate", job)
+
+    series, r, y, holdout_mask, grid_ts = _holdout_masks(job)
+    cap = holdout_exclusion_mask(grid_ts, [window], HOLDOUT_PAD_STEPS * (GRID_S * 1000))
+    # The stage's own replay construction, run on the residual WITHOUT the cap.
+    r_masked = np.where(holdout_mask, r, np.nan)
+    online = replay_online(
+        measurable_artefacts(job["shadow"]),
+        r_masked,
+        float(GRID_S),
+        suppress_alignment=True,
+        collect_power=True,
+    )
+    sig_id = str(job["shadow"]["links"][0]["signature_id"])
+    step_energy = online.energy_step_wh[sig_id]
+    ok_with = holdout_mask & ~cap & np.isfinite(r) & np.isfinite(y)
+    expected = float(np.sum(step_energy[ok_with]))
+
+    entry = next(d for d in report["devices"] if d["entity_id"] == ENTITY_KETTLE)
+    # If the implementation had masked r_masked, the replay would differ and this
+    # equality (against the un-masked replay) would fail.
+    assert entry["energy_est_wh"] == round(expected, 1)
+
+
+def test_validate_sessions_applies_capture_exclusion(tmp_path: Path) -> None:
+    """A capture window drops a session event; without the key the bytes are unchanged."""
+    job, session_ch, buf_path = _session_validate_job(tmp_path, "sess_cap")
+    day_bounds_ms = job["day_bounds_ms"]
+    n_days = len(day_bounds_ms) - 1
+    _zero_session_samples_before(buf_path, session_ch, day_bounds_ms[n_days - 7])
+
+    # Byte-identical without the key: two runs on the same job produce the same bytes.
+    plain_job = {**job, "stage_dir": str(tmp_path / "stage_sess_cap_plain")}
+    run_stage("validate_sessions", plain_job)
+    plain_bytes = (Path(plain_job["stage_dir"]) / "sessions.json").read_bytes()
+    run_stage("validate_sessions", job)
+    assert (Path(job["stage_dir"]) / "sessions.json").read_bytes() == plain_bytes
+    plain_entry = _read_sessions(job)[0]
+
+    run = _find_kettle_run_ms(
+        buf_path, session_ch, day_bounds_ms[n_days - 7], day_bounds_ms[-1]
+    )
+    assert run is not None
+    on_ms, _off_ms = run
+    capped_job = {
+        **job,
+        "stage_dir": str(tmp_path / "stage_sess_cap_out"),
+        "capture_windows": [[on_ms, on_ms + 2 * GRID_S * 1000]],
+    }
+    run_stage("validate_sessions", capped_job)
+    capped_entry = _read_sessions(capped_job)[0]
+
+    assert capped_entry["n_events"] == plain_entry["n_events"] - 1
+    assert capped_entry["energy_true_wh"] < plain_entry["energy_true_wh"]
+
+
+def test_validate_sessions_does_not_mask_the_replayed_residual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A capture window drops the metric samples but never NaNs the replay input.
+
+    The replay input keeps the pre-exclusion holdout mask (Pitfall 5); only the
+    ``ok``/``n_events`` metric mask loses the capture window. If the window had
+    masked the replay residual, the replay input would differ from the un-masked
+    run inside the capture window.
+    """
+    from custom_components.powerguesser.engine.learning import worker as worker_mod
+
+    job, session_ch, buf_path = _session_validate_job(tmp_path, "sess_resid")
+    day_bounds_ms = job["day_bounds_ms"]
+    n_days = len(day_bounds_ms) - 1
+    _zero_session_samples_before(buf_path, session_ch, day_bounds_ms[n_days - 7])
+
+    run = _find_kettle_run_ms(
+        buf_path, session_ch, day_bounds_ms[n_days - 7], day_bounds_ms[-1]
+    )
+    assert run is not None
+    on_ms, _off_ms = run
+    window = [on_ms, on_ms + 2 * GRID_S * 1000]
+
+    inputs: list[np.ndarray] = []
+    real = worker_mod.replay_online
+
+    def _spy(artefacts: Any, r: Any, *args: Any, **kwargs: Any) -> Any:
+        inputs.append(np.asarray(r, dtype=float).copy())
+        return real(artefacts, r, *args, **kwargs)
+
+    monkeypatch.setattr(worker_mod, "replay_online", _spy)
+
+    plain_job = {**job, "stage_dir": str(tmp_path / "stage_sess_resid_plain")}
+    run_stage("validate_sessions", plain_job)
+    capped_job = {
+        **job,
+        "stage_dir": str(tmp_path / "stage_sess_resid_cap"),
+        "capture_windows": [window],
+    }
+    run_stage("validate_sessions", capped_job)
+
+    assert len(inputs) == 2
+    r_plain, r_capped = inputs[0], inputs[1]
+    grid_ts = day_bounds_ms[0] + np.arange(len(r_plain), dtype=np.int64) * (GRID_S * 1000)
+    cap = holdout_exclusion_mask(grid_ts, [window], HOLDOUT_PAD_STEPS * GRID_S * 1000)
+    assert np.count_nonzero(cap) > 0
+    # The capture window is real data in the replay input (finite, not a NaN hole)...
+    assert np.isfinite(r_capped[cap]).any()
+    # ...and the input is identical to the un-capped run.
+    assert np.array_equal(r_plain, r_capped, equal_nan=True)
 
