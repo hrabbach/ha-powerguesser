@@ -24,7 +24,8 @@
           "llm_endpoint": "LLM endpoint",
           "learning": "Learning",
           "review": "Review candidates",
-          "plug_sessions": "Plug sessions"
+          "plug_sessions": "Plug sessions",
+          "capture": "Capture a device run"
         }
       },
       "plug_sessions": {
@@ -60,6 +61,48 @@
           "session": "Plug session"
         }
       },
+      "capture": {
+        "title": "Capture",
+        "description": "{status}",
+        "menu_options": {
+          "capture_start": "Start a live capture",
+          "capture_stop": "Stop the live capture",
+          "capture_retro": "Capture a past run",
+          "capture_recent": "Recent captures"
+        }
+      },
+      "capture_start": {
+        "title": "Start a live capture",
+        "description": "Start recording a run that is happening now: press Start, then let the device run. Stop the capture when the run has finished — the result appears in about 2-3 minutes and the menu never waits.\n\nA new device needs a name. A candidate or confirmed device is picked by its entry, so there is no name ambiguity.",
+        "data": {
+          "target": "What this capture teaches",
+          "name": "New device name"
+        },
+        "data_description": {
+          "target": "A new device (name it below) or an existing candidate or confirmed device.",
+          "name": "Required for a new device; leave empty when teaching an existing candidate or device."
+        }
+      },
+      "capture_recent": {
+        "title": "Recent captures",
+        "description": "{captures}"
+      },
+      "capture_retro": {
+        "title": "Capture a past run",
+        "description": "Capture a run that has already happened: give the local start and end of the window and the run is snapped to its real rise and fall edges. If the window is outside the buffered history, crosses a gap or is too short, the exact reason is shown and nothing is stored.\n\nTimes are read in the Home Assistant time zone.",
+        "data": {
+          "start": "Start",
+          "end": "End",
+          "target": "What this capture teaches",
+          "name": "New device name"
+        },
+        "data_description": {
+          "start": "The local time the run began.",
+          "end": "The local time the run ended.",
+          "target": "A new device (name it below) or an existing candidate or confirmed device.",
+          "name": "Required for a new device; leave empty when teaching an existing candidate or device."
+        }
+      },
       "review": {
         "title": "Review device candidates",
         "description": "Candidates from the last learning run, ranked by the share of unexplained energy they explain. The figures are local consistency checks on training and validation days; measured accuracy against real plug readings comes in a later version. Pick a candidate, then close the dialog when you are done.{captures_notice}",
@@ -79,7 +122,7 @@
       },
       "device": {
         "title": "Confirmed device",
-        "description": "{candidate}\n\n{evidence}",
+        "description": "{candidate}\n\n{evidence}{proposal}",
         "menu_options": {
           "accept_update": "Accept the proposed update",
           "rollback": "Restore an earlier parameter version",
@@ -136,7 +179,7 @@
           "validate_after_learning": "Validate after each learning run"
         },
         "data_description": {
-          "share_entity_names": "When enabled, names and areas of metered plugs are sent to the LLM to improve candidate labels.",
+          "share_entity_names": "When enabled, names and areas of metered plugs and your capture labels are sent to the LLM to improve candidate labels.",
           "max_tokens_per_call": "Upper limit for one LLM reply. Reasoning models spend hidden reasoning tokens inside this limit; if learning fails with output_truncated, raise it (the default 32000 suits reasoning models).",
           "schedule": "When to trigger learning automatically.",
           "truncation_guard": "Abort and notify if the endpoint reports implausibly few prompt tokens for the payload size.",
@@ -195,7 +238,9 @@
       "plug_in_session": "This plug is already used by an active plug session. End that session first.",
       "end_date_past": "The end date must be in the future.",
       "name_invalid": "Enter a name of 1 to 64 characters without control characters.",
-      "preview_needs_runs": "This preview is based on too few captured runs. Tick Confirm anyway to confirm it regardless."
+      "invalid_datetime": "Pick a valid start and end date and time.",
+      "preview_needs_runs": "This preview is based on too few captured runs. Tick Confirm anyway to confirm it regardless.",
+      "capture_refused": "Capture refused: {refusal}"
     },
     "abort": {
       "not_loaded": "PowerGuesser is not running. Reload the integration, then try again.",
@@ -294,7 +339,7 @@
         "step": {
           "confirm": {
             "title": "Confirm data sharing for learning",
-            "description": "Learning sends summaries of your household power data to {endpoint} ({location}, {transport}) for the model {model}:\n- statistics per group of similar power steps (step size, duration, hour-of-day and weekday counts, energy share)\n- reference sessions of devices that already have their own power meter\n- in refinement rounds, how well each proposed device explained the training period\n\nNo raw readings, no timestamps, no entity ids. Device names: {names}.\n\nLearning runs may include a masked validation pass: the same kind of summaries with the devices that have their own power meter mixed back in and no reference sessions, used only to measure accuracy on this installation.\n\nThe first request is {bytes} bytes; a deliberately conservative estimate puts it at up to about {tokens} tokens (providers usually count fewer). The provider may keep requests according to its own terms.\n\nTo see the exact request first, run the action \"PowerGuesser: Preview learning payload\" under Developer tools > Actions.\n\nSubmit to allow learning with this endpoint. Changing the endpoint scheme, host or port, or the device-names setting, asks again."
+            "description": "Learning sends summaries of your household power data to {endpoint} ({location}, {transport}) for the model {model}:\n- statistics per group of similar power steps (step size, duration, hour-of-day and weekday counts, energy share)\n- reference sessions of devices that already have their own power meter\n- for each capture you made: its step size, duration, energy, hour of day and weekday (your capture label only when device names are shared)\n- in refinement rounds, how well each proposed device explained the training period\n\nNo raw readings, no timestamps, no entity ids. Device names: {names}.\n\nLearning runs may include a masked validation pass: the same kind of summaries with the devices that have their own power meter mixed back in and no reference sessions, used only to measure accuracy on this installation.\n\nThe first request is {bytes} bytes; a deliberately conservative estimate puts it at up to about {tokens} tokens (providers usually count fewer). The provider may keep requests according to its own terms.\n\nTo see the exact request first, run the action \"PowerGuesser: Preview learning payload\" under Developer tools > Actions.\n\nSubmit to allow learning with this endpoint. Changing the endpoint scheme, host or port, or the device-names setting, asks again."
           }
         },
         "abort": {
@@ -455,6 +500,9 @@
           },
           "blocked_reason": {
             "name": "Blocked reason"
+          },
+          "captures_left_out_this_run": {
+            "name": "Captures left out this run"
           }
         }
       },
@@ -483,11 +531,57 @@
             "name": "Unavailable devices"
           }
         }
+      },
+      "capture_status": {
+        "name": "Capture status",
+        "state": {
+          "idle": "Idle",
+          "recording": "Recording",
+          "resolving": "Resolving"
+        },
+        "state_attributes": {
+          "capture_id": {
+            "name": "Capture ID"
+          },
+          "target_kind": {
+            "name": "Target kind"
+          },
+          "target_name": {
+            "name": "Target name"
+          },
+          "started_at": {
+            "name": "Started at"
+          },
+          "last_result": {
+            "name": "Last result"
+          }
+        }
       }
     },
     "button": {
       "learn": {
         "name": "Learn devices"
+      },
+      "capture_start": {
+        "name": "Start capture"
+      },
+      "capture_stop": {
+        "name": "Stop capture"
+      }
+    },
+    "text": {
+      "capture_label": {
+        "name": "Capture label"
+      }
+    },
+    "select": {
+      "capture_target": {
+        "name": "Capture target",
+        "state": {
+          "new_device": "New device",
+          "candidate": "Review candidate",
+          "device": "Confirmed device"
+        }
       }
     }
   },
@@ -725,6 +819,9 @@
     },
     "capture_store_full": {
       "message": "PowerGuesser keeps at most {limit} captures; only taught captures remain, so no new capture can be stored. Delete a capture first."
+    },
+    "capture_label_required": {
+      "message": "Type the name of the {target_kind} to capture into the Capture label first."
     }
   }
 }

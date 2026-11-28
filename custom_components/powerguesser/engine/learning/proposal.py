@@ -5,7 +5,13 @@ import re
 import unicodedata
 
 from ..llm_wire import extract_json
-from .prompts import CATEGORIES, REJECT_REASONS, TRACKER_KINDS
+
+# The verdict a model may attach to one capture example (D-07). Defined before the
+# prompts import on purpose: prompts builds its examples schema from this tuple at
+# import time, and proposal.py imports prompts, so the name must exist first.
+EXAMPLE_VERDICTS: tuple[str, ...] = ("consistent", "inconsistent", "cannot_tell")
+
+from .prompts import CATEGORIES, REJECT_REASONS, TRACKER_KINDS  # noqa: E402
 
 MAX_DEVICES = 40
 LABEL_MAX = 40
@@ -127,12 +133,19 @@ def validate_proposal(
     cluster_ids: Sequence[str],
     plug_ids: Sequence[str],
     cluster_kinds: Mapping[str, str] | None = None,
+    example_ids: Sequence[str] = (),
 ) -> tuple[dict | None, list[str]]:
     """Validate proposal object strictly against schema, length caps, and semantic references.
 
     cluster_kinds maps a digest cluster id to its kind ("switched" or "session"); when given,
     a "program" device may use only session clusters and a "switched" device only switched
     clusters, because compile and replay treat the two episode kinds separately.
+
+    example_ids lists the capture-example ids the reply must answer. When non-empty,
+    "example_verdicts" becomes an allowed optional root key (a reply without it still
+    validates), each entry is checked against the ids sent and the verdict enum, and a bad
+    entry is reported at "/example_verdicts/N" (D-07). With the default the key stays an
+    unknown root key and every code path is unchanged.
     """
     errors: list[tuple[str, str]] = []
 
@@ -147,11 +160,14 @@ def validate_proposal(
         "rejected_clusters",
         "merge_suggestions",
     }
+    allowed_root_keys = set(expected_root_keys)
+    if example_ids:
+        allowed_root_keys.add("example_verdicts")
     actual_root_keys = set(obj.keys())
     missing_root = expected_root_keys - actual_root_keys
     for k in sorted(missing_root):
         errors.append((f"/{k}", "missing required property"))
-    extra_root = actual_root_keys - expected_root_keys
+    extra_root = actual_root_keys - allowed_root_keys
     for k in sorted(extra_root):
         errors.append((f"/{k}", "additional property not allowed"))
 
@@ -422,6 +438,34 @@ def validate_proposal(
                 elif len(m_reason) > REASON_MAX:
                     errors.append((f"{m_path}/reason", f"exceeds maximum length of {REASON_MAX}"))
 
+    # example_verdicts (optional; only when the caller sent example ids) (D-07)
+    if example_ids and "example_verdicts" in obj:
+        verdicts = obj["example_verdicts"]
+        if not isinstance(verdicts, list):
+            errors.append(("/example_verdicts", "expected array"))
+        else:
+            expected_v_keys = {"example", "verdict"}
+            example_id_set = set(example_ids)
+            seen_examples: set[str] = set()
+            for v_idx, entry in enumerate(verdicts):
+                v_path = f"/example_verdicts/{v_idx}"
+                if not isinstance(entry, dict):
+                    errors.append((v_path, "expected object"))
+                    continue
+                if set(entry.keys()) != expected_v_keys:
+                    errors.append((v_path, "must have exactly 'example' and 'verdict'"))
+                ex = entry.get("example")
+                if not isinstance(ex, str):
+                    errors.append((v_path, "expected string 'example'"))
+                elif ex not in example_id_set:
+                    errors.append((v_path, f"example '{ex}' is not one of the example ids sent"))
+                elif ex in seen_examples:
+                    errors.append((v_path, f"duplicate example verdict '{ex}'"))
+                else:
+                    seen_examples.add(ex)
+                if entry.get("verdict") not in EXAMPLE_VERDICTS:
+                    errors.append((v_path, f"verdict must be one of {list(EXAMPLE_VERDICTS)}"))
+
     # Sort errors by (path, message)
     errors.sort(key=lambda item: (item[0], item[1]))
     formatted_errors = [f"{path}: {msg}" for path, msg in errors]
@@ -437,18 +481,24 @@ def parse_proposal(
     cluster_ids: Sequence[str],
     plug_ids: Sequence[str],
     cluster_kinds: Mapping[str, str] | None = None,
+    example_ids: Sequence[str] = (),
 ) -> tuple[dict | None, list[str], list[str]]:
     """Extract JSON from message, trim over-long free text, and validate against digest cluster/plug IDs.
 
     Returns (proposal or None, errors, trimmed paths). Trimming is a soft note, not an
-    error; every other violation is returned as an error for the repair turn.
+    error; every other violation is returned as an error for the repair turn. ``example_ids``
+    is forwarded so the optional example_verdicts field is validated (D-07).
     """
     obj, _ = extract_json(message)
     if obj is None:
         return None, ["/: no JSON object found"], []
     obj, trimmed = trim_free_text(obj)
     valid, errors = validate_proposal(
-        obj, cluster_ids=cluster_ids, plug_ids=plug_ids, cluster_kinds=cluster_kinds
+        obj,
+        cluster_ids=cluster_ids,
+        plug_ids=plug_ids,
+        cluster_kinds=cluster_kinds,
+        example_ids=example_ids,
     )
     return valid, errors, trimmed
 
@@ -460,10 +510,13 @@ def salvage(
     cluster_ids: Sequence[str],
     plug_ids: Sequence[str],
     cluster_kinds: Mapping[str, str] | None = None,
+    example_ids: Sequence[str] = (),
 ) -> tuple[dict, list[str]] | None:
-    """Drop offending devices/rejections/merges pointed to by error paths, re-validate, and return surviving proposal.
+    """Drop offending devices/rejections/merges/verdicts pointed to by error paths, re-validate, and return surviving proposal.
 
-    Over-long free text is trimmed first, so a length error alone never costs an entry.
+    Over-long free text is trimmed first, so a length error alone never costs an entry. When
+    ``example_ids`` is given, bad "/example_verdicts/N" entries are dropped too and the good
+    ones survive (D-07); with the default the candidate has no example_verdicts key.
     """
     obj, trimmed = trim_free_text(obj)
     if not isinstance(obj, dict):
@@ -474,6 +527,7 @@ def salvage(
     bad_device_indices: set[int] = set()
     bad_rejected_indices: set[int] = set()
     bad_merge_indices: set[int] = set()
+    bad_verdict_indices: set[int] = set()
 
     for err in errors:
         path = err.split(":", 1)[0].strip()
@@ -486,6 +540,9 @@ def salvage(
         m_mrg = re.match(r"^/merge_suggestions/(\d+)", path)
         if m_mrg:
             bad_merge_indices.add(int(m_mrg.group(1)))
+        m_ver = re.match(r"^/example_verdicts/(\d+)", path)
+        if m_ver:
+            bad_verdict_indices.add(int(m_ver.group(1)))
 
     devices = obj.get("devices", [])
     if not isinstance(devices, list):
@@ -526,8 +583,20 @@ def salvage(
         "merge_suggestions": surviving_merges,
     }
 
+    if example_ids and "example_verdicts" in obj:
+        verdicts = obj.get("example_verdicts")
+        candidate["example_verdicts"] = (
+            [v for idx, v in enumerate(verdicts) if idx not in bad_verdict_indices]
+            if isinstance(verdicts, list)
+            else []
+        )
+
     valid_prop, re_errors = validate_proposal(
-        candidate, cluster_ids=cluster_ids, plug_ids=plug_ids, cluster_kinds=cluster_kinds
+        candidate,
+        cluster_ids=cluster_ids,
+        plug_ids=plug_ids,
+        cluster_kinds=cluster_kinds,
+        example_ids=example_ids,
     )
     if valid_prop is None:
         return None
@@ -541,3 +610,16 @@ def salvage(
             dedup_unresolved.append(c)
 
     return valid_prop, dedup_unresolved
+
+
+def pop_example_verdicts(proposal: Mapping) -> tuple[dict, list]:
+    """Return a shallow copy of the proposal without example_verdicts, plus the verdict list.
+
+    The input dict is never mutated. A missing or non-list value yields an empty list, so a
+    caller can always iterate the result (D-07).
+    """
+    out = dict(proposal)
+    verdicts = out.pop("example_verdicts", [])
+    if not isinstance(verdicts, list):
+        verdicts = []
+    return out, verdicts

@@ -42,8 +42,10 @@ Listing PowerGuesser in the default catalog follows once the 0.x line is stable.
 ## What is sent to the LLM
 
 The learning phase sends the LLM **power-data summaries** (event and cluster features derived
-from your own buffer), never your raw history. Entity names are sent only if you opt in; the
-default is off. Before any request leaves your network you see a consent step that names the
+from your own buffer), never your raw history. Each device run you **capture** is also sent as a
+**numeric example** in the next learning run — the run's step (W), duration, energy (Wh) and the
+coarse hour and weekday, plus which digest cluster it falls in. Capture **labels** (and entity
+names) are sent only if you opt in; the default is off. Before any request leaves your network you see a consent step that names the
 destination host, whether it is local or remote, the scheme, the model, the token and byte
 estimates, and whether entity names are included. A transport downgrade (for example HTTPS to
 HTTP) requires fresh consent.

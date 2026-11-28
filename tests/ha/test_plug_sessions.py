@@ -7,7 +7,7 @@ and the Review marker are asserted end to end.
 """
 
 import copy
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
 import sqlite3
@@ -46,12 +46,24 @@ from tests.fixtures.learning.synth import ENTITY_KETTLE_SESSION, SynthSpec
 GRID_S = 30
 PLUG = "sensor.test_plug_power"
 
+# A pinned wall-clock for the one test whose verdict depends on the session /
+# synth-buffer / holdout window arithmetic (buffer 20 d, session 15 d,
+# holdout 7 d). 12:00:00 UTC is a multiple of GRID_S seconds, i.e. grid-aligned.
+# Freezing it keeps that verdict deterministic instead of swinging with the real
+# date the suite happens to run at (Windows.md #12).
+FIXED_NOW = datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc)
+
 
 def _aligned_move(freezer: Any) -> None:
     """Move the freezer to the next epoch multiple of the grid."""
     now = dt_util.utcnow().timestamp()
     aligned = math.ceil(now / GRID_S) * GRID_S
     freezer.move_to(dt_util.utc_from_timestamp(aligned))
+
+
+def _fixed_move(freezer: Any) -> None:
+    """Freeze the clock to FIXED_NOW so a test's windows never depend on the real date."""
+    freezer.move_to(FIXED_NOW)
 
 
 def _pin_grid(entry: Any) -> None:
@@ -924,11 +936,13 @@ async def test_device_session_validates_device(
         hass_storage, [make_switched_candidate("sig01", "Kettle", rise_w=2000.0)]
     )
     energy_manager.data = copy.deepcopy(std_prefs)
+    # Pin the clock before any entity state is written so every timestamp below
+    # is on the fixed instant, not the real wall-clock.
+    _fixed_move(freezer)
     async_set_power(hass, "sensor.grid_power", 1500)
     async_set_power(hass, "sensor.solar_power", 0)
     async_set_power(hass, "sensor.battery_power", 0)
     async_set_power(hass, "sensor.washer_power", 0)
-    _aligned_move(freezer)
     entry = await async_setup_via_flow(hass)
     _pin_grid(entry)
     await hass.async_block_till_done()
@@ -948,7 +962,12 @@ async def test_device_session_validates_device(
     # The plug's earlier-window readings are 0 W (the device was idle before the
     # holdout), so the constant-baseline is deliberately weak enough for the
     # D-07 energy beat (an honest v0.x limitation, see the engine test).
-    today_midnight = dt_util.start_of_local_day(dt_util.utcnow())
+    # Derive "today" from the local clock — dt_util.now(), the same basis the
+    # worker's day bounds and the synth buffer use. start_of_local_day(utcnow())
+    # reads the UTC date (HA only re-tags it with the local zone), so it lands a
+    # day late whenever the local date differs from the UTC date, which zeroed
+    # the first holdout day and pushed the energy error past the bar.
+    today_midnight = dt_util.start_of_local_day(dt_util.now())
     holdout_start_ms = int(
         round((today_midnight - timedelta(days=7)).timestamp() * 1000)
     )

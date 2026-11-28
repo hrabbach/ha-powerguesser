@@ -104,8 +104,8 @@ runner publishes its progress through `bootstrap_coordinator` to
    `ionice -c3` when available, with BLAS thread counts pinned to 1 and a
    `STAGE_TIMEOUT_S` timeout. The worker reports progress as JSON-lines events on stdout.
    The stage sequence is defined in engine/learning/worker.py:
-   `extract → compile_score → rescore → refit → validate → validate_sessions → shadow_link →
-   evidence`.
+   `extract → compile_score → rescore → refit → capture_refit → validate → validate_sessions →
+   shadow_link → evidence`.
 3. `extract` reads the residual series from the buffer (engine/learning/series.py), detects
    edges and episodes (episodes.py), clusters features with DBSCAN (digest.py), and emits a
    canonical digest. The supervisor builds the prompt (engine/learning/prompts.py) and calls
@@ -140,9 +140,17 @@ subtracted live from the remainder exactly once (hub.py).
 
 ### 5. Guided capture (admin actions)
 
-The guided-capture admin actions teach PowerGuesser one real device run without waiting for a
-learning pass. Captures stay local: nothing here reaches the LLM endpoint (captures join the
-learning payload only in a later version). `CaptureManager` (`capture.py`) owns its own
+### 5. Guided capture
+
+Guided capture teaches PowerGuesser one real device run without waiting for a learning pass. It is
+reachable from the dashboard (a `sensor.powerguesser_capture_status` enum sensor, the
+`button.powerguesser_start_capture` / `button.powerguesser_stop_capture` buttons, the
+`select.powerguesser_capture_target` select and the `text.powerguesser_capture_label` text — all
+reading one `CaptureManager` through a dispatcher signal), from the options-flow **Capture** menu,
+and from the seven admin services below. When a capture reaches a terminal state, `CaptureManager`
+fires one `powerguesser` event with `type: capture_finished` (ids and numbers only; the capture
+label never travels on the bus — an automation reads it through `capture_list`).
+`CaptureManager` (`capture.py`) owns its own
 `powerguesser.captures` Store and drives the flow. The seven admin services are:
 
 - `powerguesser.capture_window` — snap a past local start/end window to the real rise/fall
@@ -197,6 +205,35 @@ and the report's `holdout.excluded_capture` names the windows that overlap the h
 samples removed (engine/capture/exclusion.py). Captures whose target no longer resolves surface
 in Review with a notice and as a non-fixable Repairs issue.
 
+At settle, `CaptureManager._async_insight` runs one bounded, off-loop executor job: the pure
+`similar()` (engine/capture/similar.py) scores every visible candidate and confirmed device from
+the capture's own D-02 tolerance box and the learned boxes, returning a top-k list and a
+`near_twin`/`twin` decision read over the **full** scored pool; the pure `earlier_runs()`
+(engine/capture/earlier_runs.py) replays the captured signature over a bounded lookback ending at
+the rise and returns `{n, basis}`. Both are advisory only, isolated per computation, and never
+strand or fail the capture. The result is stored on the record (`result.similar`, `earlier_runs`)
+and shown in `capture_list`, the status sensor, the options flow and Review before Confirm.
+
+Captures also reach the learning request as labelled **examples**. One HA-side builder,
+`LearningSupervisor._round1_request`, is the single caller of `prompts.build_request` for the
+preview action, the consent estimate and run round 1, so the preview body is byte-identical to the
+sent body; capture rows (`CaptureManager.example_rows()`) are added fresh at request time and stay
+out of the cached worker digest and the prepare-cache key (D-06 refined). The HA-free
+`engine/learning/examples.py` selects and trims the rows into an opaque, timestamp-free block
+inside a byte budget (`eN`/`tN`, no capture id, labels only under `share_entity_names` in
+`<example_names>`), the left-out count is reported in the payload, the preview response and the
+status sensor, and the LLM's optional per-example verdicts are stored and shown as `llm_verdict`.
+The capture windows are written into every production compile round, where
+`worker._capture_gate_table` excludes them from round acceptance and from every D-17 gate call, so
+a captured run can never judge the update it informed.
+
+Clean captures aimed at a confirmed device feed the `capture_refit` worker stage, which refits the
+device on its captured runs plus the rows it already claims and judges the result through the same
+capture-excluded D-17 gate. `learning._async_capture_proposals` routes a `gated` result to
+`devices.async_set_proposal(source="capture", capture_ids, captures_snapshot_at)` and a failing one
+to `async_record_rejected_proposal`; a newer gated proposal supersedes an unaccepted one (recorded
+as `validation.last_superseded_proposal`) and Accept appends a version that rollback can undo.
+
 ## Key abstractions
 
 | Abstraction | Location | Purpose |
@@ -218,7 +255,9 @@ in Review with a notice and as a non-fixable Repairs issue.
 | `review_actions` | `custom_components/powerguesser/review_actions.py` | Shared review backend for the options flow (and the later panel): confirm / rename / dismiss / merge for candidates and devices with typed errors, plus `evidence_view` and `evidence_text`. |
 | `build_evidence` / evidence statistics | `custom_components/powerguesser/engine/learning/evidence.py` | HA-free per-candidate evidence: recent occurrences, rhythm, power/energy profile and heuristic hints. Pure, so the flow, the worker stage and the later panel reuse it. |
 | `CaptureManager` | `custom_components/powerguesser/capture.py` | Guided-capture Store (`powerguesser.captures`), the seven admin services, read-time preview candidates, capture priors and anchors for reconciliation, and the orphan Repairs issue. |
-| capture engine | `custom_components/powerguesser/engine/capture/` | HA-free capture snap (window, snap, preview, replay_check, exclusion, constants/config): retro/live window validation, the residual snap, the D-02 preview fit, the D-04 read-only replay check and the D-05 holdout exclusion. |
+| capture engine | `custom_components/powerguesser/engine/capture/` | HA-free capture snap (window, snap, preview, similar, earlier_runs, replay_check, exclusion, constants/config): retro/live window validation, the residual snap, the D-02 preview fit, the D-11 similarity/near-twin scoring, the D-12 earlier-runs replay, the D-04 read-only replay check and the D-05 holdout exclusion. |
+| Capture surfaces | `custom_components/powerguesser/sensor.py`, `button.py`, `select.py`, `text.py` | Hub capture entities (status enum sensor, Start/Stop buttons, target-kind select, label text) over one `CaptureManager` dispatcher signal (CAP-07). |
+| Capture insight & examples | `custom_components/powerguesser/engine/capture/similar.py`, `engine/capture/earlier_runs.py`, `engine/learning/examples.py` | HA-free settle-time similarity/near-twin (`similar`), the bounded earlier-runs replay (`earlier_runs`) and the labelled-example selection/trim block the learning request carries (CAP-10/11/12). |
 
 ## Directory structure rationale
 
@@ -232,7 +271,7 @@ custom_components/powerguesser/        Home Assistant integration package
 ├── devices.py, review_store.py        Confirmed devices and candidate review state
 ├── review_actions.py                  Shared review backend (confirm/rename/dismiss/merge, evidence view)
 ├── llm_client.py, consent.py          LLM transport and consent (learning phase only)
-├── sensor.py, button.py               Entity platforms
+├── sensor.py, button.py, select.py, text.py  Entity platforms
 ├── repairs.py, issues.py              Repairs issue reconciliation
 ├── bootstrap.py, energy_prefs.py      Recorder history import, Energy dashboard adapter
 └── engine/                            HA-free computation core (worker-loadable)
@@ -243,8 +282,8 @@ custom_components/powerguesser/        Home Assistant integration package
     ├── llm_wire.py                         LLM wire formats and probe strategy (pure)
     ├── worker_entry.py                     Standalone subprocess entrypoint
     ├── detect/                             Online detection (stream, online, joint, program, replay)
-    ├── capture/                            Guided capture (window, snap, preview, replay_check, exclusion, constants)
-    ├── learning/                           Learning stages (episodes, digest, prompts, compile, score, split, evidence, worker)
+    ├── capture/                            Guided capture (window, snap, preview, similar, earlier_runs, replay_check, exclusion, constants)
+    ├── learning/                           Learning stages (episodes, digest, examples, prompts, compile, score, split, evidence, worker)
     └── validation/                         Holdout validation (link, metrics, classes, drift, report)
 
 tests/                Test suites mirroring the layer split

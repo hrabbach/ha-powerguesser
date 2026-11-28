@@ -116,13 +116,263 @@ Fixed (non-configurable) limits from `const.py` include: LLM request timeout 600
 
 None. Home Assistant config entries are per-instance: there is no dev/staging/production layering, no `.env` files, and no `NODE_ENV`-style switching. To replicate a setup on another Home Assistant instance, configure the same options in its UI; the stored LLM API key and consent records are per-instance and are never exported. A diagnostics download includes the latest LLM endpoint probe result, with the base URL and the API key **redacted**.
 
-## Guided capture (admin actions)
+## Guided capture
 
-Besides the options flow, PowerGuesser exposes seven **admin-only** capture actions
-(call them as services, or from *Developer tools → Actions*). They teach the integration one
-real device run without waiting for a learning pass. Captures stay local — no capture data is
-sent to the LLM endpoint in this version (captures join the learning payload only in a later
-version).
+Guided capture teaches PowerGuesser one real device run without waiting for a learning pass. A
+captured run gives you an immediate local **preview candidate** in Review **and** a labelled
+example for the next learning run. Captures stay local, except that **every settled capture
+becomes a numeric example in the next learning run** — numbers only (step, duration, energy,
+hour, weekday and cluster). The capture's **label** is sent only when you have opted in to
+`share_entity_names` (default off). You can start, stop and review captures from the dashboard,
+the options-flow **Capture** menu, or the admin services described at the end of this section.
+
+### Capture from the dashboard
+
+Four hub-level entities and one sensor drive a capture without any service call:
+
+| Entity | Purpose |
+| --- | --- |
+| `sensor.powerguesser_capture_status` | Enum: `idle`, `recording` or `resolving`. |
+| `button.powerguesser_start_capture` | Start a live capture using the select and label below. |
+| `button.powerguesser_stop_capture` | Stop the open live capture. |
+| `select.powerguesser_capture_target` | The kind of target: `new_device`, `candidate` or `device`. |
+| `text.powerguesser_capture_label` | The target's name or id (max 64 characters). |
+
+`select.powerguesser_capture_target` and `text.powerguesser_capture_label` restore their value
+after a Home Assistant restart.
+
+The **label** has two uses:
+
+- For `new_device` it is the new device's name.
+- For `candidate` and `device` it names the target, by display name or by signature id / device
+  uuid, resolved the same way the services resolve it. An unknown or ambiguous name is refused
+  with the error that lists the choices.
+
+An **empty label** on `new_device` starts an unlabelled capture; it appears in Review at once as
+"Unnamed capture" and is named later with the normal Review rename. An empty label on `candidate`
+or `device` is refused. The label entity is cleared after a successful start; from the moment you
+type it until then its state is kept in the recorder history so a rename and the capture agree.
+
+The status sensor carries `capture_id`, `target_kind`, `target_name` and `started_at` for the open
+capture, and a `last_result` summary (quality, reason, `near_twin`, `earlier_runs`) of the newest
+finished capture. Nothing ticks: the state changes only on a transition.
+
+### Capture menu
+
+*Settings → Devices & services → PowerGuesser → Configure → Capture a device run* opens a Capture
+menu with four entries:
+
+- **Start a live capture** — a form (a new-device name, or an existing candidate or device) whose
+  Submit commits at once.
+- **Stop the live capture** — offered only while a live capture is recording.
+- **Capture a past run** — a form with a local start and end time that snaps the window to the
+  run's real edges.
+- **Recent captures** — the newest ten captures with their result, the most similar entry, the
+  earlier-runs count, the LLM's verdict and the replay-check evidence flag.
+
+No step waits: every entry calls the capture manager and returns immediately with the result
+text, exactly like the services below.
+
+### Capture insight
+
+A capture that snaps to a rise/fall pair carries two read-only insights:
+
+- **Most similar** — up to three candidates and confirmed devices, each with a similarity score,
+  its step (W) and duration, computed from the capture's own tolerance box and the learned boxes.
+- **Near twin** — a plain flag when a candidate or device is the same load as the capture: their
+  state boxes claim the capture's run, or their features sit within the tolerance distance, in
+  either direction. The named twin may sit outside the short list.
+- **Earlier runs matched** — how many runs already in the buffer the captured signature would have
+  matched, with the **basis** naming the days actually covered (a shorter buffer names the shorter
+  span). It is computed once when the capture settles, never recomputed.
+
+The insight is **advisory only**. It never blocks Confirm, and it is not an accuracy figure.
+
+### Captures in learning runs
+
+Every capture that finishes with a snapped pair becomes one numeric **example** in the next
+learning run. Each example line carries an opaque id (`e1`, `e2`, …), an opaque group token (`t1`,
+…), a quality verdict (`clean`, `contaminated`, `ambiguous`), the rise and fall step, the duration,
+the energy (Wh), the coarse hour and weekday and the digest cluster the run falls in. It carries
+**no timestamp** and no capture id.
+
+- **Labels** are sent only under the `share_entity_names` opt-in, in a separate `<example_names>`
+  block; without the opt-in only the opaque ids appear. A label names the load; it never tells the
+  model how many states or clusters the load has.
+- **Budget.** Examples share a byte budget derived from the run's input-token cap. What does not
+  fit is left out and counted: `examples_left_out n=K` in the payload, `captures_left_out` in the
+  preview action's response and `captures_left_out_this_run` on the learning status sensor. The
+  order is deterministic (one example per target first, then newest first, ties by capture id).
+- **Verdict.** The model may return an optional per-example verdict `consistent`, `inconsistent`
+  or `cannot_tell`, keyed by example id. It is stored and shown as `llm_verdict` on
+  `capture_list` and in Recent captures; it never changes a candidate, a preview or a device.
+
+The preview action's body is byte-identical to the body the learning run sends (tested), so what
+you preview is exactly what leaves your network.
+
+### Device updates from captures
+
+Clean captures aimed at a **confirmed device** are batched into the next learning run:
+
+- The run's `capture_refit` stage refits the device on its clean captured runs and the rows it
+  already claims, then the existing **no-regression gate** decides: the refit is judged on
+  validation days that **exclude every captured window**, so a capture can never validate the
+  update it informed.
+- At most one pending proposal exists per device. A newer gated update replaces an unaccepted one
+  (the supersession is recorded on the device). Accept it from the device menu
+  (*Configure → Review candidates → the device → Accept update*), which appends a new version that
+  **rollback** can undo. Nothing changes in place without your Accept.
+- **Many capture-driven refits end with no proposal.** A few extra runs rarely move the learned
+  boxes (state boxes are fitted from percentiles widened by 5 %), so the value is mostly better
+  coverage for a run the active version missed, not a new accuracy claim.
+- **Contaminated and ambiguous captures never train** a proposal; they stay as labelled examples
+  only, and the UI says so.
+- The Phase 8 **replay check** ("would the active version have claimed this run?") is shown in the
+  device menu and in Recent captures as **evidence only**; it never decides whether an update is
+  proposed.
+
+### Automation event and recipes
+
+When a capture reaches a terminal state, PowerGuesser fires one `powerguesser` event with
+`type: capture_finished`, after the record is saved. The states are `done`, `failed`, `cancelled`
+and `interrupted`; a capture that times out is `interrupted` with `reason_code: timeout`, and a
+restart fires one event per capture it marks `interrupted`.
+
+| Event data key | Meaning |
+| --- | --- |
+| `type` | Always `capture_finished`. |
+| `capture_id` | The capture's id; read the label with `powerguesser.capture_list`. |
+| `state` | `done`, `failed`, `cancelled` or `interrupted`. |
+| `quality` | `clean`, `contaminated`, `ambiguous` or `none` (null without a pair). |
+| `reason_code` | The terminal or refusal reason (`timeout`, `settle_error`, …), else null. |
+| `target_kind` | `new_device`, `candidate` or `device`. |
+| `target_id` | The opaque target id (signature id or device uuid), else null. |
+| `step_w` | The captured rise step in W, else null. |
+| `duration_s` | The run duration in seconds, else null. |
+| `energy_wh` | The run energy in Wh, else null. |
+| `near_twin` | Whether the capture is a near twin of an existing candidate or device. |
+| `earlier_runs` | How many earlier buffer runs the captured signature would have matched, else null. |
+
+The event carries **no label and no target display name** — a bus event is recorded and visible to
+every websocket subscriber. Read the label with `powerguesser.capture_list` using the event's
+`capture_id`.
+
+**NFC tag** — one tag starts a capture, a second stops it:
+
+```yaml
+- alias: Kettle capture — start (NFC)
+  triggers:
+    - trigger: tag
+      tag_id: kettle-start
+  actions:
+    - action: powerguesser.capture_start
+      data:
+        label: Kettle
+        target_type: new_device
+        target: Kettle
+```
+
+```yaml
+- alias: Kettle capture — stop (NFC)
+  triggers:
+    - trigger: tag
+      tag_id: kettle-stop
+  actions:
+    - action: powerguesser.capture_stop
+```
+
+**Voice** — a spoken command starts and stops a capture:
+
+```yaml
+- alias: Kettle capture — voice
+  triggers:
+    - trigger: conversation
+      command:
+        - start kettle capture
+  actions:
+    - action: powerguesser.capture_start
+      data:
+        label: Kettle
+        target_type: new_device
+        target: Kettle
+```
+
+```yaml
+- alias: Capture — stop by voice
+  triggers:
+    - trigger: conversation
+      command:
+        - stop capture
+  actions:
+    - action: powerguesser.capture_stop
+```
+
+**Physical button** — set the target and label entities, then press the start button:
+
+```yaml
+- alias: Capture — button start
+  triggers:
+    - trigger: state
+      entity_id: sensor.zigbee_remote_action
+      to: "start"
+  actions:
+    - action: select.select_option
+      target:
+        entity_id: select.powerguesser_capture_target
+      data:
+        option: new_device
+    - action: text.set_value
+      target:
+        entity_id: text.powerguesser_capture_label
+      data:
+        value: Kettle
+    - action: button.press
+      target:
+        entity_id: button.powerguesser_start_capture
+```
+
+```yaml
+- alias: Capture — button stop
+  triggers:
+    - trigger: state
+      entity_id: sensor.zigbee_remote_action
+      to: "stop"
+  actions:
+    - action: button.press
+      target:
+        entity_id: button.powerguesser_stop_capture
+```
+
+**Notify when a capture finishes and read its label** — the label never travels on the bus, so
+read it from `capture_list`:
+
+```yaml
+- alias: Capture finished — notify
+  triggers:
+    - trigger: event
+      event_type: powerguesser
+      event_data:
+        type: capture_finished
+        state: done
+  actions:
+    - action: powerguesser.capture_list
+      data:
+        capture_id: "{{ trigger.event.data.capture_id }}"
+      response_variable: capture
+    - action: persistent_notification.create
+      data:
+        title: Capture finished
+        message: >
+          {{ capture.captures[0].label or capture.captures[0].capture_id }} —
+          {{ trigger.event.data.quality }}, {{ trigger.event.data.step_w }} W,
+          {{ trigger.event.data.duration_s }} s,
+          {{ trigger.event.data.energy_wh }} Wh
+```
+
+### Admin capture actions
+
+Besides the dashboard and the options flow, PowerGuesser exposes seven **admin-only** capture
+actions (call them as services, or from *Developer tools → Actions*).
 
 | Action | Fields | Purpose |
 | --- | --- | --- |

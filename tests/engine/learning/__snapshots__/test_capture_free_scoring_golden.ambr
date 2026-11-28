@@ -1,0 +1,329 @@
+# serializer version: 1
+# name: test_capture_free_scoring_matches_golden
+  dict({
+    'library_1': list([
+      dict({
+        'category': 'kettle',
+        'constraints': dict({
+          'max_concurrent': 1,
+        }),
+        'extraction': dict({
+          'edge_threshold_w': 120.0,
+          'grid_s': 30,
+          'merge_samples': 2,
+          'pair_tol': 0.25,
+        }),
+        'fingerprint': dict({
+          'kind': 'switched',
+          'states': list([
+            dict({
+              'dur_s': dict({
+                'hi': 220.5,
+                'lo': 142.5,
+                'p50': 180.0,
+              }),
+              'fall_w': dict({
+                'hi': -1894.5,
+                'lo': -2105.0,
+                'p50': -2000.0,
+              }),
+              'phase_share': None,
+              'plateau_w': dict({
+                'hi': 2103.2,
+                'lo': 1893.8,
+                'p50': 1999.0,
+              }),
+              'rise_w': dict({
+                'hi': 2105.2,
+                'lo': 1891.6,
+                'p50': 1999.0,
+              }),
+            }),
+          ]),
+        }),
+        'identity': dict({
+          'matched': None,
+          'merged_into': None,
+          'status': 'new',
+          'twin_of': None,
+        }),
+        'kind': 'switched',
+        'label': 'Kettle',
+        'provenance': dict({
+          'device_ref': 'd1',
+          'input_digest': 'b4bcea5f696060a3ce48e28be0ea95b2abfe41d144c3aa36e6ea6cd759708041',
+          'member_clusters': list([
+            'c04',
+          ]),
+          'model': 'golden-model',
+          'prompt_version': 2,
+          'reference_plug': '',
+          'round': 1,
+          'run_id': 'golden-capturefree',
+        }),
+        'schema_version': 1,
+        'scores': dict({
+          'conflicts': 0,
+          'train': dict({
+            'n': 25,
+            'share': 0.035,
+          }),
+          'val': None,
+          'validated': False,
+          'validation_basis': None,
+          'validation_error_pct': None,
+        }),
+        'session': None,
+        'signature_id': '467cb401828717093b79d90f86fcbc02',
+        'states': list([
+          dict({
+            'dur_s': dict({
+              'hi': 220.5,
+              'lo': 142.5,
+              'p50': 180.0,
+            }),
+            'fall_w': dict({
+              'hi': -1894.5,
+              'lo': -2105.0,
+              'p50': -2000.0,
+            }),
+            'name': 'heat',
+            'phase_share': None,
+            'plateau_w': dict({
+              'hi': 2103.2,
+              'lo': 1893.8,
+              'p50': 1999.0,
+            }),
+            'rise_w': dict({
+              'hi': 2105.2,
+              'lo': 1891.6,
+              'p50': 1999.0,
+            }),
+          }),
+        ]),
+        'time_prior': dict({
+          'dow': list([
+            0.1875,
+            0.0938,
+            0.125,
+            0.125,
+            0.125,
+            0.125,
+            0.2188,
+          ]),
+          'hour': list([
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0612,
+            0.0816,
+            0.1429,
+            0.0612,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0816,
+            0.0612,
+            0.102,
+            0.0816,
+            0.0204,
+            0.0204,
+            0.0204,
+          ]),
+        }),
+      }),
+    ]),
+    'library_2': list([
+      dict({
+        'category': 'kettle',
+        'constraints': dict({
+          'max_concurrent': 1,
+        }),
+        'extraction': dict({
+          'edge_threshold_w': 120.0,
+          'grid_s': 30,
+          'merge_samples': 2,
+          'pair_tol': 0.25,
+        }),
+        'fingerprint': dict({
+          'kind': 'switched',
+          'states': list([
+            dict({
+              'dur_s': dict({
+                'hi': 220.5,
+                'lo': 142.5,
+                'p50': 180.0,
+              }),
+              'fall_w': dict({
+                'hi': -1894.5,
+                'lo': -2105.0,
+                'p50': -2000.0,
+              }),
+              'phase_share': None,
+              'plateau_w': dict({
+                'hi': 2103.2,
+                'lo': 1893.8,
+                'p50': 1999.0,
+              }),
+              'rise_w': dict({
+                'hi': 2105.2,
+                'lo': 1891.6,
+                'p50': 1999.0,
+              }),
+            }),
+          ]),
+        }),
+        'identity': dict({
+          'matched': None,
+          'merged_into': None,
+          'status': 'new',
+          'twin_of': None,
+        }),
+        'kind': 'switched',
+        'label': 'Kettle',
+        'proposal_gate': dict({
+          'active_S': 0.0359,
+          'basis': 'learning_split_val',
+          'passed': True,
+          'proposed_S': 0.0359,
+        }),
+        'provenance': dict({
+          'device_ref': 'd1',
+          'input_digest': 'b4bcea5f696060a3ce48e28be0ea95b2abfe41d144c3aa36e6ea6cd759708041',
+          'member_clusters': list([
+            'c04',
+          ]),
+          'model': 'golden-model',
+          'prompt_version': 2,
+          'reference_plug': '',
+          'round': 2,
+          'run_id': 'golden-capturefree',
+        }),
+        'schema_version': 1,
+        'scores': dict({
+          'conflicts': 0,
+          'train': dict({
+            'n': 25,
+            'share': 0.035,
+          }),
+          'val': None,
+          'validated': False,
+          'validation_basis': None,
+          'validation_error_pct': None,
+        }),
+        'session': None,
+        'signature_id': 'dda7c7a944b8b817c343a2f9e29d48bb',
+        'states': list([
+          dict({
+            'dur_s': dict({
+              'hi': 220.5,
+              'lo': 142.5,
+              'p50': 180.0,
+            }),
+            'fall_w': dict({
+              'hi': -1894.5,
+              'lo': -2105.0,
+              'p50': -2000.0,
+            }),
+            'name': 'heat',
+            'phase_share': None,
+            'plateau_w': dict({
+              'hi': 2103.2,
+              'lo': 1893.8,
+              'p50': 1999.0,
+            }),
+            'rise_w': dict({
+              'hi': 2105.2,
+              'lo': 1891.6,
+              'p50': 1999.0,
+            }),
+          }),
+        ]),
+        'time_prior': dict({
+          'dow': list([
+            0.1875,
+            0.0938,
+            0.125,
+            0.125,
+            0.125,
+            0.125,
+            0.2188,
+          ]),
+          'hour': list([
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0612,
+            0.0816,
+            0.1429,
+            0.0612,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0204,
+            0.0816,
+            0.0612,
+            0.102,
+            0.0816,
+            0.0204,
+            0.0204,
+            0.0204,
+          ]),
+        }),
+      }),
+    ]),
+    'out_1': dict({
+      'S': 0.03590360368334746,
+      'accepted': True,
+      'conflict_share': 0.0,
+      'n_artefacts': 1,
+      'unresolved': list([
+      ]),
+    }),
+    'out_2': dict({
+      'S': 0.03590360368334746,
+      'accepted': False,
+      'conflict_share': 0.0,
+      'n_artefacts': 1,
+      'unresolved': list([
+      ]),
+    }),
+    'val_1': dict({
+      'S': 0.0359,
+      'accepted': True,
+      'conflict_share': 0.0,
+      'per_signature': dict({
+        '467cb401828717093b79d90f86fcbc02': dict({
+          'claimed_share': 0.0359,
+          'n': 15,
+        }),
+      }),
+      'round': 1,
+    }),
+    'val_2': dict({
+      'S': 0.0359,
+      'accepted': False,
+      'conflict_share': 0.0,
+      'per_signature': dict({
+        'dda7c7a944b8b817c343a2f9e29d48bb': dict({
+          'claimed_share': 0.0359,
+          'n': 15,
+        }),
+      }),
+      'round': 2,
+    }),
+  })
+# ---

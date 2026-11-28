@@ -5,7 +5,7 @@ from datetime import timedelta
 from homeassistant.const import Platform
 
 DOMAIN = "powerguesser"
-PLATFORMS = [Platform.SENSOR, Platform.BUTTON]
+PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.TEXT, Platform.SELECT]
 OWN_PLATFORM = DOMAIN
 
 BUFFER_DIR = "powerguesser"
@@ -16,6 +16,12 @@ RETENTION_INTERVAL = timedelta(days=1)
 
 SIGNAL_PREFS_UPDATED = "powerguesser_energy_prefs_updated"
 SIGNAL_PROFILE_SOURCES = "powerguesser_profile_sources"
+# One dispatcher signal for every capture transition (Plan 09-01, D-01): the
+# capture status sensor, the target select and the label text subscribe to
+# ``f"{SIGNAL_CAPTURE_UPDATED}_{entry.entry_id}"``. The bus event a terminal
+# capture fires carries ``type: capture_finished`` (D-13).
+SIGNAL_CAPTURE_UPDATED = "powerguesser_capture_updated"
+CAPTURE_FINISHED = "capture_finished"
 STRUCTURAL_GRACE_S = 60
 TICK_INTERVAL = timedelta(seconds=10)
 

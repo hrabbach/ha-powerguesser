@@ -59,7 +59,7 @@ async def test_options_menu_includes_learning(
     energy_manager: object,
     std_prefs: dict[str, Any],
 ) -> None:
-    """The options menu lists phases, llm_endpoint, learning, review and plug_sessions."""
+    """The options menu lists phases, llm_endpoint, learning, review, plug_sessions and capture."""
     energy_manager.data = std_prefs
     _set_std_powers(hass)
     entry = await async_setup_via_flow(hass)
@@ -73,6 +73,7 @@ async def test_options_menu_includes_learning(
         "learning",
         "review",
         "plug_sessions",
+        "capture",
     ]
 
 

@@ -5,12 +5,14 @@ import pytest
 
 from custom_components.powerguesser.engine.learning.proposal import (
     ANALYSIS_MAX,
+    EXAMPLE_VERDICTS,
     LABEL_MAX,
     MAX_DEVICES,
     RATIONALE_MAX,
     REASON_MAX,
     TRIM_MARK,
     parse_proposal,
+    pop_example_verdicts,
     salvage,
     sanitize_label,
     trim_free_text,
@@ -537,3 +539,148 @@ def test_salvage_keeps_over_length_devices_after_trimming(sample_digest):
     assert [d["ref"] for d in salvaged_prop["devices"]] == ["d1"]
     assert len(salvaged_prop["devices"][0]["label"]) == LABEL_MAX
     assert unresolved == ["c99"]
+
+
+def _with_verdicts(sample_digest, verdicts):
+    prop = proposal_for(sample_digest)
+    prop["example_verdicts"] = verdicts
+    return prop
+
+
+def test_verdicts_optional_and_validated(sample_digest):
+    """With example ids, example_verdicts is optional but each entry is validated (D-07)."""
+    clusters, plugs = ["c01", "c02"], ["p1"]
+
+    # Absent is valid.
+    base = proposal_for(sample_digest)
+    valid, errors = validate_proposal(
+        base, cluster_ids=clusters, plug_ids=plugs, example_ids=("e1", "e2")
+    )
+    assert valid is not None
+    assert errors == []
+
+    # A valid list is accepted.
+    prop = _with_verdicts(
+        sample_digest,
+        [
+            {"example": "e1", "verdict": "consistent"},
+            {"example": "e2", "verdict": "cannot_tell"},
+        ],
+    )
+    valid, errors = validate_proposal(
+        prop, cluster_ids=clusters, plug_ids=plugs, example_ids=("e1", "e2")
+    )
+    assert valid is not None
+    assert errors == []
+    assert set(EXAMPLE_VERDICTS) == {"consistent", "inconsistent", "cannot_tell"}
+
+    # Unknown example id.
+    prop = _with_verdicts(sample_digest, [{"example": "e9", "verdict": "consistent"}])
+    valid, errors = validate_proposal(
+        prop, cluster_ids=clusters, plug_ids=plugs, example_ids=("e1", "e2")
+    )
+    assert valid is None
+    assert any(e.startswith("/example_verdicts/0:") for e in errors)
+
+    # Unknown verdict.
+    prop = _with_verdicts(sample_digest, [{"example": "e1", "verdict": "maybe"}])
+    _, errors = validate_proposal(
+        prop, cluster_ids=clusters, plug_ids=plugs, example_ids=("e1", "e2")
+    )
+    assert any(e.startswith("/example_verdicts/0:") for e in errors)
+
+    # Extra key.
+    prop = _with_verdicts(sample_digest, [{"example": "e1", "verdict": "consistent", "x": 1}])
+    _, errors = validate_proposal(
+        prop, cluster_ids=clusters, plug_ids=plugs, example_ids=("e1", "e2")
+    )
+    assert any(e.startswith("/example_verdicts/0:") for e in errors)
+
+    # Duplicate example id -> the second entry errors.
+    prop = _with_verdicts(
+        sample_digest,
+        [
+            {"example": "e1", "verdict": "consistent"},
+            {"example": "e1", "verdict": "inconsistent"},
+        ],
+    )
+    _, errors = validate_proposal(
+        prop, cluster_ids=clusters, plug_ids=plugs, example_ids=("e1", "e2")
+    )
+    assert any(e.startswith("/example_verdicts/1:") for e in errors)
+
+    # Without example ids the key stays an unknown root key (capture-free unchanged).
+    prop = _with_verdicts(sample_digest, [{"example": "e1", "verdict": "consistent"}])
+    _, errors = validate_proposal(prop, cluster_ids=clusters, plug_ids=plugs)
+    assert any(e.startswith("/example_verdicts:") for e in errors)
+
+
+def test_parse_proposal_takes_example_ids(sample_digest):
+    """parse_proposal forwards example_ids and reports the same example_verdicts paths."""
+    clusters, plugs = ["c01", "c02"], ["p1"]
+
+    prop = _with_verdicts(sample_digest, [{"example": "e1", "verdict": "consistent"}])
+    msg = chat_completion(json.dumps(prop))["choices"][0]["message"]
+    valid, errors, trimmed = parse_proposal(
+        msg, cluster_ids=clusters, plug_ids=plugs, example_ids=("e1",)
+    )
+    assert valid is not None
+    assert errors == []
+
+    prop = _with_verdicts(sample_digest, [{"example": "e9", "verdict": "consistent"}])
+    msg = chat_completion(json.dumps(prop))["choices"][0]["message"]
+    valid, errors, _ = parse_proposal(
+        msg, cluster_ids=clusters, plug_ids=plugs, example_ids=("e1",)
+    )
+    assert valid is None
+    assert any(e.startswith("/example_verdicts/0:") for e in errors)
+
+
+def test_salvage_drops_bad_verdicts_only(sample_digest):
+    """Salvage keeps the devices and drops only the bad verdict entries (D-07)."""
+    clusters, plugs = ["c01", "c02"], ["p1"]
+
+    prop = _with_verdicts(
+        sample_digest,
+        [
+            {"example": "e1", "verdict": "consistent"},
+            {"example": "e9", "verdict": "consistent"},  # bad
+            {"example": "e2", "verdict": "cannot_tell"},
+        ],
+    )
+    _, errors = validate_proposal(
+        prop, cluster_ids=clusters, plug_ids=plugs, example_ids=("e1", "e2")
+    )
+    assert any("/example_verdicts/1:" in e for e in errors)
+
+    salvaged = salvage(
+        prop, errors, cluster_ids=clusters, plug_ids=plugs, example_ids=("e1", "e2")
+    )
+    assert salvaged is not None
+    salvaged_prop, _ = salvaged
+    assert salvaged_prop["devices"] == prop["devices"]
+    assert salvaged_prop["example_verdicts"] == [
+        {"example": "e1", "verdict": "consistent"},
+        {"example": "e2", "verdict": "cannot_tell"},
+    ]
+
+
+def test_pop_example_verdicts():
+    """pop_example_verdicts returns the proposal without the key plus the verdicts; input untouched."""
+    prop = {
+        "analysis": "a",
+        "devices": [],
+        "example_verdicts": [{"example": "e1", "verdict": "consistent"}],
+    }
+    without, verdicts = pop_example_verdicts(prop)
+    assert without == {"analysis": "a", "devices": []}
+    assert verdicts == [{"example": "e1", "verdict": "consistent"}]
+    assert "example_verdicts" in prop  # not mutated
+
+    without2, verdicts2 = pop_example_verdicts({"analysis": "a"})
+    assert without2 == {"analysis": "a"}
+    assert verdicts2 == []
+
+    # A non-list value yields an empty list.
+    _, verdicts3 = pop_example_verdicts({"analysis": "a", "example_verdicts": "nope"})
+    assert verdicts3 == []

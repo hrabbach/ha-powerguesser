@@ -58,6 +58,7 @@ CAPTURE_WINDOW_KEYS = {
     "holdout_excluded",
     "holdout_window_ms",
     "replay",
+    "earlier_runs",
 }
 
 
@@ -221,7 +222,7 @@ async def test_capture_record_schema_is_complete(
     std_prefs: dict[str, Any],
     hass_storage: dict[str, Any],
 ) -> None:
-    """The stored record carries exactly the 22 D-05 keys and the holdout marker."""
+    """The stored record carries exactly the 23 D-05 keys and the holdout marker."""
     entry, data = await _setup(hass, energy_manager, std_prefs)
     on_ms, off_ms = data.kettle_runs[-1]
 

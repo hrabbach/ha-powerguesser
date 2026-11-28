@@ -42,6 +42,8 @@ class CaptureConfig:
     holdout_pad_steps: int = c.HOLDOUT_PAD_STEPS
     replay_pre_roll_s: int = c.REPLAY_PRE_ROLL_S
     max_capture_records: int = c.MAX_CAPTURE_RECORDS
+    similar_top_k: int = c.SIMILAR_TOP_K
+    earlier_runs_lookback_days: int = c.EARLIER_RUNS_LOOKBACK_DAYS
 
 
 DEFAULT_CONFIG = CaptureConfig()

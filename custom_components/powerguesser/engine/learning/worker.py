@@ -40,7 +40,7 @@ from .episodes import (
 )
 from .evidence import build_evidence
 from .identity import match_identities
-from .score import accept, block_score, gate_proposal, replay, scorecard
+from .score import GATE_BASIS, ReplayResult, accept, block_score, gate_proposal, replay, scorecard
 from .series import load_residual
 from .split import (
     MIN_DAY_COVERAGE,
@@ -77,6 +77,9 @@ STAGES: tuple[str, ...] = (
     "compile_score",
     "rescore",
     "refit",
+    # Plan 09-05 (CAP-13, D-09): refit a confirmed device from its captured runs,
+    # judged by the same capture-excluded D-17 gate path.
+    "capture_refit",
     "validate",
     "validate_sessions",
     "shadow_link",
@@ -545,6 +548,146 @@ def extract(job: Mapping) -> dict:
     }
 
 
+def _rows_overlapping_windows(
+    row_start_ms: np.ndarray,
+    row_end_ms: np.ndarray,
+    capture_windows: Sequence[Sequence[int]],
+    pad_ms: int,
+) -> np.ndarray:
+    """Bool mask of episode rows whose span overlaps a padded capture window (D-10).
+
+    A row spans ``[row_start_ms, row_end_ms]``; a padded window is the half-open
+    ``[start - pad_ms, end + pad_ms)`` of the ``holdout_exclusion_mask`` convention.
+    Covered are a row with an endpoint inside a window, and a row that spans a
+    whole window (neither endpoint inside).
+    """
+    mask = holdout_exclusion_mask(row_start_ms, capture_windows, pad_ms) | holdout_exclusion_mask(
+        row_end_ms, capture_windows, pad_ms
+    )
+    for window in capture_windows:
+        win_start = int(window[0]) - pad_ms
+        win_end = int(window[1]) + pad_ms
+        mask |= (row_start_ms < win_start) & (row_end_ms >= win_end)
+    return mask
+
+
+def _capture_gate_table(
+    episodes: Mapping[str, np.ndarray],
+    capture_windows: Sequence[Sequence[int]],
+    start_ms: int | None,
+    step_ms: int | None,
+) -> Mapping[str, np.ndarray]:
+    """The episode table the capture-excluded scorings read (D-10 gate scope, Plan 09-05).
+
+    With no capture windows the original table is returned unchanged, so a
+    capture-free run scores exactly as today. Otherwise a shallow copy carries a
+    copied ``block`` array in which every row overlapping a padded capture window
+    (``HOLDOUT_PAD_STEPS`` grid steps each side) has block ``-1``, so the row is in
+    neither the train (0) nor the validation (1) replay; every other array stays
+    shared. ``start_ms`` and ``step_ms`` are the residual grid's origin and step;
+    without them the exclusion cannot be computed and the caller must treat the
+    block as empty (insufficient_validation).
+    """
+    if not capture_windows:
+        return episodes
+
+    table = dict(episodes)
+    if start_ms is None or step_ms is None:
+        # Deliberate defense-in-depth: every production caller (compile_score and
+        # _gate_excluding_captures) already guarantees a non-None residual grid
+        # before calling, so this branch is not reached today. It is kept so a
+        # future caller cannot score a table it could not exclude against.
+        table["block"] = np.full(len(episodes.get("block", [])), -1, dtype=np.int32)
+        return table
+
+    step = int(step_ms)
+    pad_ms = HOLDOUT_PAD_STEPS * step
+    row_start_ms = int(start_ms) + episodes["start_i"] * step
+    row_end_ms = int(start_ms) + episodes["end_i"] * step
+    excluded = _rows_overlapping_windows(row_start_ms, row_end_ms, capture_windows, pad_ms)
+
+    block = np.array(episodes["block"], copy=True)
+    block[excluded] = -1
+    table["block"] = block
+    return table
+
+
+def _insufficient_gate_verdict() -> dict[str, object]:
+    """The D-10 verdict when the capture-excluded validation block is empty.
+
+    The gate is never a pass here: reporting a pass on a block with no scoreable
+    row would be a vacuous 0.0 >= 0.0. The reason marks the verdict as not a score.
+    """
+    return {
+        "passed": False,
+        "proposed_S": None,
+        "active_S": None,
+        "basis": GATE_BASIS,
+        "reason": "insufficient_validation",
+    }
+
+
+def _gate_excluding_captures(
+    proposed: SignatureArtefact,
+    active: SignatureArtefact,
+    episodes: Mapping[str, np.ndarray],
+    val_residual: float,
+    *,
+    capture_windows: Sequence[Sequence[int]],
+    start_ms: int | None,
+    step_ms: int | None,
+) -> dict[str, object]:
+    """The one D-17 gate path, on the capture-excluded table (D-10 gate scope).
+
+    The only direct caller of the score module's gate helper. With capture windows
+    and a residual grid the gate reads ``_capture_gate_table``; a job whose
+    exclusion leaves no validation row — or that carries no residual grid to
+    exclude with — is never a pass: it returns the ``insufficient_validation``
+    verdict and does not call the gate. Without capture windows the table is the
+    original episodes object, so a capture-free run gets the unchanged D-17 verdict
+    (an emptied block included, per the plan's capture-free pin).
+    """
+    if capture_windows:
+        if start_ms is None or step_ms is None:
+            # Deliberate defense-in-depth: today's callers always pass a residual
+            # grid alongside a non-empty capture_windows (the grid is written with
+            # the episodes the job reads), so this is not reached in practice. It
+            # is kept as the documented contract for a future caller that has no
+            # grid to exclude with.
+            return _insufficient_gate_verdict()
+        table = _capture_gate_table(episodes, capture_windows, start_ms, step_ms)
+        if not bool(np.any(table["block"] == 1)):
+            return _insufficient_gate_verdict()
+    else:
+        table = episodes
+    return gate_proposal(proposed, active, table, val_residual)
+
+
+def _anchor_rows(
+    episodes: Mapping[str, np.ndarray],
+    start_ms: int,
+    step_ms: int,
+    rise_ms: float,
+    fall_ms: float,
+) -> set[int]:
+    """Episode rows a capture's snapped rise/fall anchor to (CAP-09/CAP-13).
+
+    A kind-0 row whose rise is within ``ANCHOR_TOL_STEPS`` grid steps of
+    ``rise_ms`` and whose fall is within the same tolerance of ``fall_ms``. The
+    same rule drives compile_score's capture-anchor mapping and capture_refit, so a
+    capture maps to a row the same way in both.
+    """
+    tol_ms = ANCHOR_TOL_STEPS * int(step_ms)
+    ep_start_ms = int(start_ms) + episodes["start_i"] * int(step_ms)
+    ep_end_ms = int(start_ms) + episodes["end_i"] * int(step_ms)
+    mask = (
+        (episodes["kind"] == 0)
+        & (np.abs(ep_start_ms - float(rise_ms)) <= tol_ms)
+        & (np.abs(ep_end_ms - float(fall_ms)) <= tol_ms)
+    )
+    return {int(r) for r in np.where(mask)[0]}
+
+
 def compile_score(job: Mapping) -> dict:
     """Execute compile_score stage: compile proposal into signature artefacts."""
     stage_dir = Path(job.get("stage_dir", "."))
@@ -615,26 +758,88 @@ def compile_score(job: Mapping) -> dict:
     scorecard_path = stage_dir / f"scorecard_{round_no}.json"
     _write_atomic(scorecard_path, canonical_json(scorecard_dict))
 
-    val_res = replay(artefacts, episodes, block=1, residual_wh=float(block_residual["val"]))
-    val_S, val_conf = block_score(val_res)
-    incumbent = job.get("incumbent")
-    accepted = True if incumbent is None else accept((val_S, val_conf), incumbent)
+    # D-10 gate scope (Plan 09-05): a run whose compile job carries capture_windows
+    # reads the capture-excluded table for every scoring that judges a proposal —
+    # the round acceptance below and every D-17 gate call — so captured runs never
+    # judge what they trained or informed. The residual grid's origin and step are
+    # read once here (header only) so the exclusion can be computed; without them
+    # (or with no capture window) the exclusion cannot engage.
+    capture_windows = job.get("capture_windows") or []
+    residual_path = stage_dir / "residual.npz"
+    exclusion_start_ms: int | None = None
+    exclusion_step_ms: int | None = None
+    if capture_windows and residual_path.is_file():
+        with np.load(str(residual_path), allow_pickle=False) as exclusion_grid:
+            exclusion_start_ms = int(exclusion_grid["start_ms"][0])
+            exclusion_step_ms = int(exclusion_grid["step_ms"][0])
+    if capture_windows and exclusion_start_ms is not None and exclusion_step_ms is not None:
+        acceptance_table = _capture_gate_table(
+            episodes, capture_windows, exclusion_start_ms, exclusion_step_ms
+        )
+    else:
+        acceptance_table = episodes
+    insufficient_validation = bool(capture_windows) and (
+        exclusion_start_ms is None
+        or exclusion_step_ms is None
+        or not bool(np.any(acceptance_table["block"] == 1))
+    )
 
-    val_dict = {
-        "round": round_no,
-        "S": round(float(val_S), 5),
-        "conflict_share": round(float(val_conf), 5),
-        "accepted": accepted,
-        "per_signature": {
-            sig: {
-                "claimed_share": round(float(stats["claimed_wh"]) / val_res.denominator_wh, 4)
-                if val_res.denominator_wh > 0
-                else 0.0,
-                "n": int(stats["n"]),
-            }
-            for sig, stats in val_res.per_signature.items()
-        },
-    }
+    # The full-block validation replay stays as it is: per-artefact scores,
+    # validation_error_pct and the evidence claim sets read it and describe a
+    # candidate (they judge no proposal). Only the round acceptance and every
+    # D-17 gate read the capture-excluded table.
+    val_res = replay(artefacts, episodes, block=1, residual_wh=float(block_residual["val"]))
+    incumbent = job.get("incumbent")
+
+    if insufficient_validation:
+        # D-10: the exclusion emptied the validation block. block_score and accept
+        # are not consulted for acceptance, and val_{round}.json carries the reason
+        # instead of a score (this holds for round 1 too; the run-level outcome is
+        # the HA side's). The 0.0 values keep the stage-output contract numeric.
+        val_S = 0.0
+        val_conf = 0.0
+        accepted = False
+        val_dict = {
+            "round": round_no,
+            "S": 0.0,
+            "conflict_share": 0.0,
+            "accepted": False,
+            "reason": "insufficient_validation",
+            "per_signature": {},
+        }
+    else:
+        # The acceptance replay is the full-block replay itself when there is no
+        # exclusion (capture-free: no second replay, identical output); otherwise
+        # the same artefacts replay over the capture-excluded table on block 1 with
+        # the same val residual energy as the denominator (every round of a run and
+        # both sides of a gate share it, so comparisons are unaffected).
+        accept_res = (
+            val_res
+            if acceptance_table is episodes
+            else replay(
+                artefacts,
+                acceptance_table,
+                block=1,
+                residual_wh=float(block_residual["val"]),
+            )
+        )
+        val_S, val_conf = block_score(accept_res)
+        accepted = True if incumbent is None else accept((val_S, val_conf), incumbent)
+        val_dict = {
+            "round": round_no,
+            "S": round(float(val_S), 5),
+            "conflict_share": round(float(val_conf), 5),
+            "accepted": accepted,
+            "per_signature": {
+                sig: {
+                    "claimed_share": round(float(stats["claimed_wh"]) / accept_res.denominator_wh, 4)
+                    if accept_res.denominator_wh > 0
+                    else 0.0,
+                    "n": int(stats["n"]),
+                }
+                for sig, stats in accept_res.per_signature.items()
+            },
+        }
     val_path = stage_dir / f"val_{round_no}.json"
     _write_atomic(val_path, canonical_json(val_dict))
 
@@ -649,7 +854,6 @@ def compile_score(job: Mapping) -> dict:
     # (switched rows only), so both sides cover the same episode population.
     # Preview runs and a missing residual cache give None (with basis None).
     val_error_pct: dict[str, float | None] = {}
-    residual_path = stage_dir / "residual.npz"
     if validated_flag and residual_path.is_file():
         with np.load(str(residual_path), allow_pickle=False) as residual_data:
             r_full = np.asarray(residual_data["r"], dtype=np.float64)
@@ -761,10 +965,6 @@ def compile_score(job: Mapping) -> dict:
             with np.load(str(residual_path), allow_pickle=False) as anchor_data:
                 anchor_start_ms = int(anchor_data["start_ms"][0])
                 anchor_step_ms = int(anchor_data["step_ms"][0])
-            tol_ms = ANCHOR_TOL_STEPS * anchor_step_ms
-            ep_start_ms = anchor_start_ms + episodes["start_i"] * anchor_step_ms
-            ep_end_ms = anchor_start_ms + episodes["end_i"] * anchor_step_ms
-            ep_kind = episodes["kind"]
             unmapped: list[str] = []
             for anchor in capture_anchors_raw:
                 sig = str(anchor.get("signature_id", ""))
@@ -776,12 +976,7 @@ def compile_score(job: Mapping) -> dict:
                 except (KeyError, TypeError, ValueError):
                     unmapped.append(sig)
                     continue
-                mask = (
-                    (ep_kind == 0)
-                    & (np.abs(ep_start_ms - rise_ms) <= tol_ms)
-                    & (np.abs(ep_end_ms - fall_ms) <= tol_ms)
-                )
-                rows = {int(r) for r in np.where(mask)[0]}
+                rows = _anchor_rows(episodes, anchor_start_ms, anchor_step_ms, rise_ms, fall_ms)
                 if rows:
                     # Several captures can share one signature_id: union their
                     # rows rather than overwriting, so every captured episode of
@@ -836,11 +1031,14 @@ def compile_score(job: Mapping) -> dict:
             if not detection_differs(active_raw, matched):
                 continue
             try:
-                matched["proposal_gate"] = gate_proposal(
+                matched["proposal_gate"] = _gate_excluding_captures(
                     SignatureArtefact.from_dict(matched),
                     SignatureArtefact.from_dict(active_raw),
                     episodes,
                     val_residual,
+                    capture_windows=capture_windows,
+                    start_ms=exclusion_start_ms,
+                    step_ms=exclusion_step_ms,
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -917,6 +1115,10 @@ def compile_score(job: Mapping) -> dict:
         "n_artefacts": len(matched_dicts),
         "unresolved": unresolved,
     }
+    # D-10: only a compile round whose capture-excluded validation block was
+    # emptied carries a reason; every other compile output keeps its exact shape.
+    if insufficient_validation:
+        out["reason"] = "insufficient_validation"
     # Only a job that carried capture_anchors gains the key, so the Plan 04-13
     # golden and the shadow job (no anchors) keep their exact output shape.
     if capture_anchors_raw:
@@ -1280,6 +1482,267 @@ def evidence(job: Mapping) -> dict:
     }
 
 
+# The capture ``features`` columns the refit fit reads with plain ``np.percentile``
+# (compile.fit_state_boxes). A non-finite value in any of them makes the whole
+# assigned state's box NaN — the rise/fall/dur/plateau percentiles are not
+# isfinite-guarded (only the phase-share boxes are) — so a capture row that cannot
+# supply a finite value for each is dropped from the fit rather than appended as NaN.
+_FIT_REQUIRED_FEATURES: tuple[str, ...] = ("rise_w", "fall_w", "dur_s", "plateau_w")
+
+
+def _finite_feature(row: Mapping, key: str) -> float | None:
+    """Coerce one captured feature to a finite float, else None.
+
+    A missing, non-numeric or NaN/Inf value (a hand-edited or partially written
+    capture) yields None, so the caller can drop the offending row instead of
+    appending a non-finite value that would poison a state's boxes.
+    """
+    features = row.get("features")
+    value = features.get(key) if isinstance(features, Mapping) else None
+    if value is None:
+        return None
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return None
+    return coerced if np.isfinite(coerced) else None
+
+
+def _fit_only_table(
+    episodes: Mapping[str, np.ndarray],
+    feature_rows: Sequence[Mapping],
+) -> dict[str, np.ndarray]:
+    """episodes plus one appended row per *usable* unmapped capture, fit columns only.
+
+    An unmapped capture (no anchored episode row) contributes its stored
+    ``features`` snapshot — the preview fit's row layout — to the refit fit table,
+    but never to a replayed table: the appended rows carry only the columns the
+    fit reads (the rise/fall/dur/plateau boxes, the three phase shares, hour and
+    dow). Every other column stays the original array, which the fit never indexes
+    past its length.
+
+    A capture whose required numeric fit feature (rise/fall/dur/plateau) is missing
+    or non-finite is DROPPED, never appended as NaN. A NaN rise would be assigned by
+    ``_refit_from_rows`` to the nearest-rise state (every containment test is False
+    for NaN and an all-NaN ``min`` key returns index 0), and ``fit_state_boxes`` would
+    then turn that whole state's rise/fall/dur/plateau boxes NaN. That NaN-boxed
+    artefact replays to nothing, and because the D-17 gate is ``proposed_S >=
+    active_S`` it PASSES when the active artefact also scores 0 — and its NaN boxes
+    are then serialized into capture_refit.json. The appended rows are exactly the
+    captures with all four features finite; the caller derives their table indices
+    from the returned length.
+    """
+    n_base = len(episodes["start_i"])
+    table = dict(episodes)
+
+    usable = [
+        row
+        for row in feature_rows
+        if all(_finite_feature(row, key) is not None for key in _FIT_REQUIRED_FEATURES)
+    ]
+
+    def _float_column(key: str) -> np.ndarray:
+        values: list[float] = []
+        for row in usable:
+            # A required key is finite here (the row passed the filter above); the
+            # optional phase-share columns fall back to NaN, which fit_state_boxes
+            # ignores, exactly as a missing value did before.
+            value = _finite_feature(row, key)
+            values.append(float("nan") if value is None else value)
+        base = np.asarray(
+            episodes.get(key, np.full(n_base, np.nan, dtype=np.float64)), dtype=np.float64
+        )
+        return np.concatenate([base, np.asarray(values, dtype=np.float64)])
+
+    for key in ("rise_w", "fall_w", "dur_s", "plateau_w", "l1_share", "l2_share", "l3_share"):
+        table[key] = _float_column(key)
+
+    for key in ("hour", "dow"):
+        values_int: list[int] = []
+        for row in usable:
+            features = row.get("features")
+            raw = features.get(key) if isinstance(features, Mapping) else None
+            if raw is None:
+                values_int.append(0)
+                continue
+            try:
+                values_int.append(int(raw))
+            except (TypeError, ValueError):
+                # Same guard as examples._int_or_zero: a hand-edited/partially
+                # written capture's hour/dow can be absent or non-numeric, and
+                # int() raising here would drop every device's refit. Default 0.
+                values_int.append(0)
+        table[key] = np.concatenate(
+            [np.asarray(episodes[key], dtype=np.int32), np.asarray(values_int, dtype=np.int32)]
+        )
+    return table
+
+
+def _refit_from_rows(
+    current: SignatureArtefact,
+    table: Mapping[str, np.ndarray],
+    union_idx: Sequence[int],
+    threshold_w: float,
+    *,
+    provenance: Mapping[str, object],
+) -> SignatureArtefact:
+    """Fit a device's states from a union of episode rows (shared, Plan 04-12/09-05).
+
+    Each union episode is assigned to the current artefact's state whose rise box
+    contains its rise_w, else the state with the nearest rise p50. A state with
+    fewer than MIN_TRAIN_EPISODES union episodes keeps its current boxes, so a
+    retrain never drops a state. The time prior comes from the union rows with
+    compile's Laplace+1 formula. The returned artefact keeps the current
+    signature_id, kind, label, category, extraction, session and constraints, with
+    the given provenance and empty scores (``_refit_scores`` fills them).
+    """
+    per_state: list[list[int]] = [[] for _ in current.states]
+    for idx in union_idx:
+        rise = float(table["rise_w"][idx])
+        containing = [
+            si for si, st in enumerate(current.states) if st.rise_w.lo <= rise <= st.rise_w.hi
+        ]
+        if containing:
+            si = containing[0]
+        else:
+            si = min(
+                range(len(current.states)),
+                key=lambda s: abs(float(current.states[s].rise_w.p50) - rise),
+            )
+        per_state[si].append(int(idx))
+
+    new_states: list[object] = []
+    for si, st in enumerate(current.states):
+        indices = per_state[si]
+        if len(indices) >= MIN_TRAIN_EPISODES:
+            new_states.append(
+                fit_state_boxes(
+                    table,
+                    np.array(indices, dtype=np.int64),
+                    threshold_w,
+                    name=st.name,
+                )
+            )
+        else:
+            # Too few union episodes: keep the current boxes (never drop a state).
+            new_states.append(st)
+
+    union_arr = np.array(list(union_idx), dtype=np.int64)
+    n_union = len(union_idx)
+    if n_union > 0:
+        hour_counts = np.bincount(table["hour"][union_arr].astype(int), minlength=24)[:24]
+        hour_smoothed = (hour_counts + 1.0) / (n_union + 24.0)
+        dow_counts = np.bincount(table["dow"][union_arr].astype(int), minlength=7)[:7]
+        dow_smoothed = (dow_counts + 1.0) / (n_union + 7.0)
+        time_prior: dict[str, list[float]] = {
+            "hour": [round(float(x), 4) for x in hour_smoothed],
+            "dow": [round(float(x), 4) for x in dow_smoothed],
+        }
+    else:
+        time_prior = dict(current.time_prior)
+
+    return SignatureArtefact(
+        schema_version=current.schema_version,
+        signature_id=current.signature_id,
+        kind=current.kind,
+        label=current.label,
+        category=current.category,
+        extraction=current.extraction,
+        states=tuple(new_states),
+        session=current.session,
+        time_prior=time_prior,
+        constraints=current.constraints,
+        provenance=dict(provenance),
+        scores={},
+    )
+
+
+def _refit_scores(
+    new_art: SignatureArtefact,
+    table: Mapping[str, np.ndarray],
+    block_residual_wh: Mapping[str, float],
+    validated: bool,
+    *,
+    residual: np.ndarray | None,
+    phases: Mapping[str, np.ndarray] | None,
+    day_bounds_ms: Sequence[int],
+    start_ms: int | None,
+    step_ms: int | None,
+    suppress_alignment: bool,
+    val_days: Sequence[int],
+    conflicts: int,
+) -> tuple[SignatureArtefact, ReplayResult]:
+    """Score a refitted artefact like compile_score/refit do (shared, Plan 09-05).
+
+    Train and val shares are fractions of each block's residual energy; the D-16
+    ``validation_error_pct`` replays the validation days of the residual when
+    ``validated`` and a residual plus its grid are available, else stays None.
+    Returns the artefact with its scores filled in, plus the block-1 replay of the
+    refitted artefact, so ``refit`` reuses that replay for ``new_S`` instead of
+    recomputing the identical one.
+    """
+    train_res = replay([new_art], table, block=0, residual_wh=float(block_residual_wh["train"]))
+    train_stats = train_res.per_signature.get(new_art.signature_id, {})
+    train_denom = train_res.denominator_wh
+    t_share = float(train_stats.get("claimed_wh", 0.0)) / train_denom if train_denom > 0 else 0.0
+
+    val_res = replay([new_art], table, block=1, residual_wh=float(block_residual_wh["val"]))
+    v_stats = val_res.per_signature.get(new_art.signature_id, {})
+    val_denom = val_res.denominator_wh
+    v_share = float(v_stats.get("claimed_wh", 0.0)) / val_denom if val_denom > 0 else 0.0
+
+    err_pct: float | None = None
+    if validated and residual is not None and start_ms is not None and step_ms is not None:
+        val_days_list = [int(d) for d in val_days]
+        sample_day = (
+            np.searchsorted(
+                np.array(day_bounds_ms, dtype=np.int64),
+                int(start_ms) + np.arange(len(residual), dtype=np.int64) * int(step_ms),
+                side="right",
+            )
+            - 1
+        )
+        r_val = np.where(np.isin(sample_day, val_days_list), residual, np.nan)
+        claimed_rows = [
+            int(i)
+            for i in val_res.claims.get(new_art.signature_id, set())
+            if int(table["kind"][int(i)]) == 0
+        ]
+        reference_wh = float(np.sum(table["energy_wh"][claimed_rows])) if claimed_rows else 0.0
+        err_pct = validation_error_pct(
+            new_art.to_dict(),
+            r_val,
+            float(step_ms) / 1000.0,
+            reference_wh,
+            phases=phases if phases else None,
+            suppress_alignment=suppress_alignment,
+        )
+
+    return SignatureArtefact(
+        schema_version=new_art.schema_version,
+        signature_id=new_art.signature_id,
+        kind=new_art.kind,
+        label=new_art.label,
+        category=new_art.category,
+        extraction=new_art.extraction,
+        states=new_art.states,
+        session=new_art.session,
+        time_prior=new_art.time_prior,
+        constraints=new_art.constraints,
+        provenance=new_art.provenance,
+        scores={
+            "train": {"share": round(t_share, 3), "n": int(train_stats.get("n", 0))},
+            "val": (
+                {"share": round(v_share, 3), "n": int(v_stats.get("n", 0))} if validated else None
+            ),
+            "validated": validated,
+            "conflicts": conflicts,
+            "validation_error_pct": err_pct,
+            "validation_basis": "learning_split" if err_pct is not None else None,
+        },
+    ), val_res
+
+
 def refit(job: Mapping) -> dict:
     """Execute the refit stage: locally retrain a device on the union of its own
     and its merged candidates' train episodes (D-13).
@@ -1330,7 +1793,6 @@ def refit(job: Mapping) -> dict:
         phase_channels,
     )
     r = series.residual
-    step_s = float(grid_s)
 
     total_days = len(day_bounds_ms) - 1
     valid_days = data_days(r, start_ms, step_ms, day_bounds_ms)
@@ -1379,150 +1841,36 @@ def refit(job: Mapping) -> dict:
         if int(table["kind"][int(i)]) == 0
     )
 
-    # Assign each union episode to the current artefact's state whose rise box
-    # contains its rise_w, else the state with the nearest rise p50.
-    per_state: list[list[int]] = [[] for _ in current.states]
-    for idx in union_idx:
-        rise = float(table["rise_w"][idx])
-        containing = [
-            si
-            for si, st in enumerate(current.states)
-            if st.rise_w.lo <= rise <= st.rise_w.hi
-        ]
-        if containing:
-            si = containing[0]
-        else:
-            si = min(
-                range(len(current.states)),
-                key=lambda s: abs(float(current.states[s].rise_w.p50) - rise),
-            )
-        per_state[si].append(idx)
-
-    new_states: list[object] = []
-    for si, st in enumerate(current.states):
-        indices = per_state[si]
-        if len(indices) >= MIN_TRAIN_EPISODES:
-            new_states.append(
-                fit_state_boxes(
-                    table,
-                    np.array(indices, dtype=np.int64),
-                    threshold_w,
-                    name=st.name,
-                )
-            )
-        else:
-            # Too few union episodes: keep the current boxes (never drop a state).
-            new_states.append(st)
-
-    # Time prior from the union with the compile.py formula.
-    union_arr = np.array(union_idx, dtype=np.int64)
-    n_union = len(union_idx)
-    if n_union > 0:
-        hour_counts = np.bincount(table["hour"][union_arr].astype(int), minlength=24)[:24]
-        hour_smoothed = (hour_counts + 1.0) / (n_union + 24.0)
-        dow_counts = np.bincount(table["dow"][union_arr].astype(int), minlength=7)[:7]
-        dow_smoothed = (dow_counts + 1.0) / (n_union + 7.0)
-        time_prior: dict[str, list[float]] = {
-            "hour": [round(float(x), 4) for x in hour_smoothed],
-            "dow": [round(float(x), 4) for x in dow_smoothed],
-        }
-    else:
-        time_prior = dict(current.time_prior)
-
-    new_art = SignatureArtefact(
-        schema_version=current.schema_version,
-        signature_id=current.signature_id,
-        kind=current.kind,
-        label=current.label,
-        category=current.category,
-        extraction=current.extraction,
-        states=tuple(new_states),
-        session=current.session,
-        time_prior=time_prior,
-        constraints=current.constraints,
-        provenance={
-            "source": "union",
-            "aliases": [a.signature_id for a in extra],
-        },
-        scores={},
-    )
-
-    # Scores like compile_score, replaying the refitted artefact alone.
-    train_res = replay([new_art], table, block=0, residual_wh=float(block_residual_wh["train"]))
-    train_stats = train_res.per_signature.get(new_art.signature_id, {})
-    train_denom = train_res.denominator_wh
-    t_share = (
-        float(train_stats.get("claimed_wh", 0.0)) / train_denom if train_denom > 0 else 0.0
+    # Fit the states from the union (shared with the capture_refit stage), then
+    # score the refitted artefact like compile_score does.
+    new_art = _refit_from_rows(
+        current,
+        table,
+        union_idx,
+        threshold_w,
+        provenance={"source": "union", "aliases": [a.signature_id for a in extra]},
     )
     conflicts_cnt = len(union_res.conflicts_with.get(current.signature_id, set()))
-
-    val_res = replay([new_art], table, block=1, residual_wh=float(block_residual_wh["val"]))
-    v_stats = val_res.per_signature.get(new_art.signature_id, {})
-    val_denom = val_res.denominator_wh
-    v_share = float(v_stats.get("claimed_wh", 0.0)) / val_denom if val_denom > 0 else 0.0
-
-    # D-16 (Plan 04-07): same computation as compile_score, with the fresh
-    # split's validation days and the in-memory residual (refit loads r itself,
-    # so no residual.npz round trip is needed).
-    err_pct: float | None = None
-    if validated:
-        val_days = [int(d) for d in split.val]
-        sample_day = (
-            np.searchsorted(
-                np.array(day_bounds_ms, dtype=np.int64),
-                start_ms + np.arange(len(r), dtype=np.int64) * step_ms,
-                side="right",
-            )
-            - 1
-        )
-        r_val = np.where(np.isin(sample_day, val_days), r, np.nan)
-        claimed_rows = [
-            int(i)
-            for i in val_res.claims.get(new_art.signature_id, set())
-            if int(table["kind"][int(i)]) == 0
-        ]
-        reference_wh = (
-            float(np.sum(table["energy_wh"][claimed_rows])) if claimed_rows else 0.0
-        )
-        err_pct = validation_error_pct(
-            new_art.to_dict(),
-            r_val,
-            step_s,
-            reference_wh,
-            phases=series.phases if series.phases else None,
-            suppress_alignment="short_event" not in enabled_event_types,
-        )
-
-    new_art = SignatureArtefact(
-        schema_version=new_art.schema_version,
-        signature_id=new_art.signature_id,
-        kind=new_art.kind,
-        label=new_art.label,
-        category=new_art.category,
-        extraction=new_art.extraction,
-        states=new_art.states,
-        session=new_art.session,
-        time_prior=new_art.time_prior,
-        constraints=new_art.constraints,
-        provenance=new_art.provenance,
-        scores={
-            "train": {"share": round(t_share, 3), "n": int(train_stats.get("n", 0))},
-            "val": (
-                {"share": round(v_share, 3), "n": int(v_stats.get("n", 0))}
-                if validated
-                else None
-            ),
-            "validated": validated,
-            "conflicts": conflicts_cnt,
-            "validation_error_pct": err_pct,
-            "validation_basis": "learning_split" if err_pct is not None else None,
-        },
+    new_art, new_val = _refit_scores(
+        new_art,
+        table,
+        block_residual_wh,
+        validated,
+        residual=r,
+        phases=series.phases or None,
+        day_bounds_ms=day_bounds_ms,
+        start_ms=start_ms,
+        step_ms=step_ms,
+        suppress_alignment="short_event" not in enabled_event_types,
+        val_days=split.val,
+        conflicts=conflicts_cnt,
     )
 
     # Keep-or-reject (D-13): same validation days, no-worse rule, no margin.
     cur_val = replay([current], table, block=1, residual_wh=float(block_residual_wh["val"]))
     current_S, _cur_conf = block_score(cur_val)
-    new_S, _new_conf = block_score(val_res)
+    # _refit_scores already replayed the refitted artefact on block 1; reuse it.
+    new_S, _new_conf = block_score(new_val)
     accepted = bool(new_S >= current_S)
 
     refit_dict = {
@@ -1540,6 +1888,193 @@ def refit(job: Mapping) -> dict:
         "accepted": accepted,
         "current_S": float(refit_dict["current_S"]),
         "new_S": float(refit_dict["new_S"]),
+    }
+
+
+def capture_refit(job: Mapping) -> dict:
+    """Execute the capture_refit stage: refit a confirmed device from captured runs (CAP-13, D-09).
+
+    The niced worker (no Home Assistant) turns captured runs aimed at a confirmed
+    switched device into a refitted candidate and judges it with the unchanged
+    D-17 gate on validation days that exclude every captured run — the shared
+    ``_gate_excluding_captures``/``_capture_gate_table`` path (D-10), so this stage
+    never adds a second gate path. The device itself is never changed here: the
+    result is a proposal the HA side routes through ``async_set_proposal``.
+
+    The union is the kind-0 train rows the current artefact already claims plus each
+    capture's anchored rows (set semantics, so a captured run already claimed is
+    not counted twice). An unmapped capture contributes its stored features row to
+    the fit table only, never to a replay, and is counted in ``n_unmapped``.
+    """
+    stage_dir = Path(job.get("stage_dir", "."))
+    validated = bool(job.get("validated", False))
+    captures_snapshot_at = job.get("captures_snapshot_at")
+    capture_windows = job.get("capture_windows") or []
+    devices = job.get("devices") or []
+
+    episodes = load_episodes(stage_dir / "episodes.npz")
+    with open(stage_dir / "digest_meta.json", "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    threshold_w = float(meta.get("edge_threshold_w", 120))
+    block_residual = meta["block_residual_wh"]
+    val_residual = float(block_residual["val"])
+    val_days = [int(d) for d in (meta.get("days", {}).get("val") or [])]
+
+    # The residual grid (origin, step) and the D-16 residual come from the run's
+    # extract dir, never from the buffer (the extract stage already wrote them).
+    start_ms: int | None = None
+    step_ms: int | None = None
+    residual_r: np.ndarray | None = None
+    res_phases: Mapping[str, np.ndarray] | None = None
+    res_suppress = False
+    day_bounds_ms: list[int] = []
+    residual_path = stage_dir / "residual.npz"
+    if residual_path.is_file():
+        with np.load(str(residual_path), allow_pickle=False) as residual_data:
+            start_ms = int(residual_data["start_ms"][0])
+            step_ms = int(residual_data["step_ms"][0])
+            residual_r = np.asarray(residual_data["r"], dtype=np.float64)
+            day_bounds_ms = [
+                int(b) for b in np.asarray(residual_data["day_bounds_ms"], dtype=np.int64)
+            ]
+            res_suppress = bool(int(residual_data["suppress_alignment"][0]))
+            phase_keys = [k for k in ("l1", "l2", "l3") if k in residual_data.files]
+            if phase_keys:
+                res_phases = {
+                    k: np.asarray(residual_data[k], dtype=np.float64) for k in phase_keys
+                }
+
+    entries: list[dict[str, object]] = []
+    for device in devices:
+        device_uuid = str(device.get("device_uuid", ""))
+        signature_id = str(device.get("signature_id", ""))
+        current = SignatureArtefact.from_dict(device["current"])
+        captures = list(device.get("captures") or [])
+        capture_ids = sorted(str(cap.get("capture_id", "")) for cap in captures)
+
+        entry: dict[str, object] = {
+            "device_uuid": device_uuid,
+            "signature_id": signature_id,
+            "reason": None,
+            "passed": None,
+            "proposed_S": None,
+            "active_S": None,
+            "basis": None,
+            "artefact": None,
+            "capture_ids": capture_ids,
+            "n_unmapped": 0,
+        }
+
+        if current.kind == "program":
+            # A single rise/fall pair never matches a stage template (RESEARCH Pitfall 1).
+            entry["reason"] = "program_not_supported"
+            entries.append(entry)
+            continue
+
+        # Union: the kind-0 train rows the current artefact claims, plus each
+        # capture's anchored rows (set semantics: no double count).
+        current_claims = replay(
+            [current], episodes, block=0, residual_wh=float(block_residual["train"])
+        ).claims.get(current.signature_id, set())
+        union_rows = {int(i) for i in current_claims if int(episodes["kind"][int(i)]) == 0}
+
+        feature_rows: list[Mapping] = []
+        for capture in captures:
+            rows: set[int] = set()
+            if start_ms is not None and step_ms is not None:
+                try:
+                    rows = _anchor_rows(
+                        episodes,
+                        start_ms,
+                        step_ms,
+                        float(capture["rise_ms"]),
+                        float(capture["fall_ms"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    rows = set()
+            if rows:
+                union_rows |= rows
+            else:
+                feature_rows.append(capture)
+        entry["n_unmapped"] = len(feature_rows)
+
+        fit_table = episodes
+        if feature_rows:
+            # An unmapped capture teaches the fit only (its features row), never a
+            # replayed table. A capture whose required numeric features are not finite
+            # is dropped inside _fit_only_table, so it never poisons a state's boxes;
+            # only the rows that survived the append join the union.
+            fit_table = _fit_only_table(episodes, feature_rows)
+            base = len(episodes["start_i"])
+            n_appended = len(fit_table["rise_w"]) - base
+            union_rows |= {base + i for i in range(n_appended)}
+
+        proposed = _refit_from_rows(
+            current,
+            fit_table,
+            sorted(union_rows),
+            threshold_w,
+            provenance={
+                "source": "capture",
+                "capture_ids": capture_ids,
+                "captures_snapshot_at": captures_snapshot_at,
+            },
+        )
+
+        if not detection_differs(current.to_dict(), proposed.to_dict()):
+            # A handful of added rows only moves the percentile boxes when a
+            # capture lies in a tail, so many capture refits end here (RESEARCH A6).
+            entry["reason"] = "no_change"
+            entries.append(entry)
+            continue
+
+        gate = _gate_excluding_captures(
+            proposed,
+            current,
+            episodes,
+            val_residual,
+            capture_windows=capture_windows,
+            start_ms=start_ms,
+            step_ms=step_ms,
+        )
+        if gate.get("reason") == "insufficient_validation":
+            entry["reason"] = "insufficient_validation"
+            entry["passed"] = False
+            entries.append(entry)
+            continue
+
+        scored, _proposed_val = _refit_scores(
+            proposed,
+            episodes,
+            block_residual,
+            validated,
+            residual=residual_r,
+            phases=res_phases,
+            day_bounds_ms=day_bounds_ms,
+            start_ms=start_ms,
+            step_ms=step_ms,
+            suppress_alignment=res_suppress,
+            val_days=val_days,
+            conflicts=0,
+        )
+        # Stamp the gate on the artefact dict exactly as compile_score stamps a
+        # gated LLM artefact, so the device menu reads one key for both origins.
+        artefact = scored.to_dict()
+        artefact["proposal_gate"] = dict(gate)
+        entry["passed"] = bool(gate["passed"])
+        entry["proposed_S"] = gate["proposed_S"]
+        entry["active_S"] = gate["active_S"]
+        entry["basis"] = gate["basis"]
+        entry["artefact"] = artefact
+        entry["reason"] = "gated" if gate["passed"] else "worse_than_active"
+        entries.append(entry)
+
+    result_path = stage_dir / "capture_refit.json"
+    _write_atomic(result_path, canonical_json({"devices": entries}))
+    return {
+        "stage_dir": str(stage_dir),
+        "result": str(result_path),
+        "n_devices": len(entries),
     }
 
 
@@ -2489,6 +3024,8 @@ def run_stage(stage: str, job: Mapping) -> dict:
         return rescore(job)
     if stage == "refit":
         return refit(job)
+    if stage == "capture_refit":
+        return capture_refit(job)
     if stage == "validate":
         return validate(job)
     if stage == "validate_sessions":
@@ -2526,7 +3063,7 @@ def stage_outputs(stage: str, result: Mapping) -> dict:
             "insufficient_data": bool(result.get("insufficient_data", False)),
         }
     if stage == "compile_score":
-        return {
+        out = {
             "stage_dir": str(stage_dir),
             "library": str(result["library"]),
             "scorecard": str(result["scorecard"]),
@@ -2537,6 +3074,13 @@ def stage_outputs(stage: str, result: Mapping) -> dict:
             "n_artefacts": int(result.get("n_artefacts", 0)),
             "unresolved": [str(r) for r in result.get("unresolved", [])],
         }
+        # D-10 (Plan 09-05): a compile round whose capture-excluded validation
+        # block was emptied reports insufficient_validation; the supervisor reads
+        # this key to keep round 1 as the base library and stop refining (09-06).
+        # Capture-free rounds carry no reason key, so their shape is unchanged.
+        if "reason" in result:
+            out["reason"] = str(result["reason"])
+        return out
     if stage == "rescore":
         return {
             "S": float(result["S"]),
@@ -2566,6 +3110,12 @@ def stage_outputs(stage: str, result: Mapping) -> dict:
             "accepted": bool(result["accepted"]),
             "current_S": float(result["current_S"]),
             "new_S": float(result["new_S"]),
+        }
+    if stage == "capture_refit":
+        return {
+            "stage_dir": str(stage_dir),
+            "result": str(result["result"]),
+            "n_devices": int(result.get("n_devices", 0)),
         }
     if stage == "validate":
         return {

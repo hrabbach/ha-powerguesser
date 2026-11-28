@@ -1191,15 +1191,23 @@ class DeviceRuntime:
         run_id: str,
         proposed_at: str,
         trained_at: str | None,
+        source: str | None = None,
+        capture_ids: list[str] | None = None,
+        captures_snapshot_at: str | None = None,
     ) -> None:
         """Store a learning-run proposal as the device's pending proposal (D-11).
 
         The proposal replaces an older pending one and never touches the
         parameter versions: the stored artefact drops the identity, fingerprint
         and first_label decorations (the version entry holds the plain
-        artefact, exactly like a confirm). A coordinator refresh is pushed so
-        the power sensor's update_available attribute shows without a new
-        aligner publish.
+        artefact, exactly like a confirm). A newer gated proposal supersedes an
+        unaccepted one and the supersession is recorded in
+        ``validation.last_superseded_proposal`` with an INFO log (D-09,
+        T-09-17). When ``source`` is given (a capture proposal) the pending dict
+        additionally carries ``source``, ``capture_ids`` and
+        ``captures_snapshot_at``; the LLM path keeps exactly its five keys. A
+        coordinator refresh is pushed so the power sensor's update_available
+        attribute shows without a new aligner publish.
         """
         rec = self._devices.get(uuid)
         if rec is None or rec.get("status") != "confirmed":
@@ -1209,13 +1217,40 @@ class DeviceRuntime:
             for k, v in artefact.items()
             if k not in CANDIDATE_DECORATION_KEYS
         }
-        rec["pending_proposal"] = {
+        existing = rec.get("pending_proposal")
+        if isinstance(existing, Mapping):
+            superseded_at = dt_util.utcnow().isoformat()
+            validation = rec.get("validation")
+            if not isinstance(validation, dict):
+                validation = {}
+                rec["validation"] = validation
+            validation["last_superseded_proposal"] = {
+                "run_id": existing.get("run_id"),
+                "proposed_at": existing.get("proposed_at"),
+                "source": existing.get("source") or "proposal",
+                "superseded_at": superseded_at,
+                "superseded_by_run_id": run_id,
+            }
+            _LOGGER.info(
+                "Device %s proposal from run %s (%s) supersedes run %s (%s)",
+                uuid,
+                run_id,
+                source or "proposal",
+                existing.get("run_id"),
+                existing.get("source") or "proposal",
+            )
+        proposal: dict[str, Any] = {
             "artefact": art,
             "run_id": run_id,
             "proposed_at": proposed_at,
             "trained_at": trained_at,
             "scores": dict(artefact.get("scores") or {}),
         }
+        if source is not None:
+            proposal["source"] = source
+            proposal["capture_ids"] = list(capture_ids or [])
+            proposal["captures_snapshot_at"] = captures_snapshot_at
+        rec["pending_proposal"] = proposal
         await self._async_save_cold()
         self._republish()
 
@@ -1301,7 +1336,8 @@ class DeviceRuntime:
     async def async_accept_proposal(self, uuid: str) -> int:
         """Accept the pending proposal as parameter version n+1 and activate it (D-11).
 
-        The proposal's artefact is appended with source "proposal" under the
+        The proposal's artefact is appended with the pending proposal's source
+        (default "proposal"; a capture proposal carries "capture") under the
         same device uuid, every earlier version is kept, the proposal is
         cleared and the new version is activated through async_activate_version
         (the same path rollback uses, D-25). Raises ValueError without a
@@ -1329,7 +1365,7 @@ class DeviceRuntime:
                 "trained_at": proposal.get("trained_at"),
                 "scores": dict(proposal.get("scores") or {}),
                 "accepted_at": dt_util.utcnow().isoformat(),
-                "source": "proposal",
+                "source": str(proposal.get("source") or "proposal"),
             }
         )
         rec["pending_proposal"] = None

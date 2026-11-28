@@ -336,3 +336,34 @@ def test_refit_uses_shared_helpers(tmp_path: Path) -> None:
         name="on",
     )
     assert State.from_dict(new_art["states"][0]) == expected
+
+
+def test_refit_reuses_the_refitted_val_replay_for_new_S(tmp_path, monkeypatch) -> None:
+    """The refitted artefact is val-replayed once and new_S is the block_score of
+    that same replay (the old code replayed it a second time only to read new_S)."""
+    from custom_components.powerguesser.engine.learning.score import block_score
+
+    buf, bounds = _two_level_kettle_buffer(tmp_path)
+    job = _job(tmp_path / "stage", buf, bounds, _current_artefact(), [_extra_artefact()])
+
+    calls: list = []
+    original = worker.replay
+
+    def spy(artefacts, table, block, residual_wh=None):
+        result = original(artefacts, table, block, residual_wh)
+        calls.append((list(artefacts), block, result))
+        return result
+
+    monkeypatch.setattr(worker, "replay", spy)
+
+    res = run_stage("refit", job)
+
+    # The refitted artefact carries provenance source "union"; the current one does not.
+    refitted_val = [
+        c for c in calls if c[1] == 1 and c[0] and c[0][0].provenance.get("source") == "union"
+    ]
+    assert len(refitted_val) == 1, "the refitted artefact must be val-replayed exactly once"
+    new_S, _conf = block_score(refitted_val[0][2])
+    refit = json.loads(Path(res["result"]).read_text(encoding="utf-8"))
+    assert refit["new_S"] == round(float(new_S), 5)
+    assert res["new_S"] == refit["new_S"]

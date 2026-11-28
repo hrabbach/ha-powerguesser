@@ -382,7 +382,14 @@ async def test_run_never_changes_confirmed_params(
     assert rec["active_v"] == 1
     unchanged = copy.deepcopy(json.loads(blob))
     assert rec["pending_proposal"] is not None
-    cleared = {**rec, "pending_proposal": unchanged["pending_proposal"]}
+    # Plan 09-06: replacing an unaccepted proposal also records the supersession
+    # under validation (a diagnostics key, like last_rejected_proposal), so the
+    # byte-identity check clears it alongside the pending proposal.
+    cleared = {
+        **rec,
+        "pending_proposal": unchanged["pending_proposal"],
+        "validation": unchanged["validation"],
+    }
     assert json.dumps(cleared, sort_keys=True, default=str) == blob
 
 

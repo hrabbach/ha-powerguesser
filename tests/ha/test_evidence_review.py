@@ -970,7 +970,8 @@ def test_strings_identical_and_placeholders() -> None:
 
     step = json.loads(strings_bytes)["options"]["step"]
     assert step["candidate"]["description"] == "{candidate}\n\n{evidence}"
-    assert step["device"]["description"] == "{candidate}\n\n{evidence}"
+    # Plan 09-06 appended the {proposal} block to the device menu (D-09/D-10).
+    assert step["device"]["description"] == "{candidate}\n\n{evidence}{proposal}"
 
 
 # ---------------------------------------------------------------------------

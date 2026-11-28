@@ -42,7 +42,7 @@ async def test_options_menu_lists_phases_and_llm_endpoint(
     energy_manager: EnergyManager,
     std_prefs: dict[str, Any],
 ) -> None:
-    """Options menu lists phases, llm_endpoint, learning, review and plug_sessions."""
+    """Options menu lists phases, llm_endpoint, learning, review, plug_sessions and capture."""
     energy_manager.data = std_prefs
     async_set_power(hass, "sensor.grid_power", 500)
     async_set_power(hass, "sensor.solar_power", 1200)
@@ -59,6 +59,7 @@ async def test_options_menu_lists_phases_and_llm_endpoint(
         "learning",
         "review",
         "plug_sessions",
+        "capture",
     ]
 
 

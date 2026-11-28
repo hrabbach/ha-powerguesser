@@ -571,6 +571,127 @@ def capture_gate(cand: Mapping[str, Any]) -> tuple[int, int] | None:
     return None
 
 
+def _insight_name(hub: Any, kind: Any, ident: Any, stored: Any) -> str:
+    """The current name of a similar/twin entry, else its stored name (T-09-08).
+
+    Names are re-resolved from the current candidate or device when it still
+    exists, so a rename is shown under its new name; otherwise the name stored
+    with the capture is used.
+    """
+    kind_s = str(kind or "")
+    ident_s = str(ident or "")
+    if kind_s == "candidate":
+        learning = getattr(hub, "learning", None)
+        if learning is not None:
+            cand = next(
+                (
+                    c
+                    for c in learning.visible_candidates()
+                    if str(c.get("signature_id") or "") == ident_s
+                ),
+                None,
+            )
+            if cand is not None:
+                return str(learning.display_name(cand))
+    elif kind_s == "device":
+        devices = getattr(hub, "devices", None)
+        rec = devices.record(ident_s) if devices is not None else None
+        if isinstance(rec, Mapping) and rec.get("status") == "confirmed":
+            name = rec.get("name")
+            if isinstance(name, str) and name.strip():
+                return name
+    return str(stored) if stored else ident_s
+
+
+def _insight_detail(entry: Mapping[str, Any]) -> str:
+    """``<score>, <step_w> W, <dur> min`` for one similar entry."""
+    details = [str(entry.get("score"))]
+    step_w = entry.get("step_w")
+    if step_w is not None:
+        try:
+            details.append(f"{round(float(step_w))} W")
+        except (TypeError, ValueError):
+            pass
+    dur_s = entry.get("dur_s")
+    if dur_s is not None:
+        try:
+            details.append(f"{round(float(dur_s) / 60)} min")
+        except (TypeError, ValueError):
+            pass
+    return ", ".join(details)
+
+
+def capture_insight_text(hub: Any, target_kind: str, target_id: str) -> str:
+    """The stored similarity, near-twin and earlier-runs insight for a target.
+
+    D-11/D-12 (CAP-11, CAP-12): the newest ``done`` capture whose read-time
+    resolved target is ``(target_kind, target_id)`` and that carries
+    ``result.similar`` or ``earlier_runs`` decides the block: up to three
+    ``Most similar`` entries (`` — near twin`` on the stored twin), a
+    ``Near twin:`` line when the twin is not among the listed entries, and
+    ``Earlier runs matched: <n> (<basis>)`` with the stored basis. It ends with
+    the D-11 advisory sentence. Read-only and pure; ``""`` when nothing applies.
+    """
+    captures = getattr(hub, "captures", None)
+    if captures is None:
+        return ""
+
+    best: Mapping[str, Any] | None = None
+    for entry in reversed(captures.list_view()):
+        if entry.get("state") != "done":
+            continue
+        target = entry.get("target")
+        if (
+            not isinstance(target, Mapping)
+            or str(target.get("kind")) != str(target_kind)
+            or str(target.get("id")) != str(target_id)
+        ):
+            continue
+        result = entry.get("result")
+        similar = result.get("similar") if isinstance(result, Mapping) else None
+        if not similar and not entry.get("earlier_runs"):
+            continue
+        best = entry
+        break
+    if best is None:
+        return ""
+
+    result = best.get("result")
+    similar = (
+        result.get("similar")
+        if isinstance(result, Mapping) and isinstance(result.get("similar"), Mapping)
+        else {}
+    )
+    twin = similar.get("twin")
+    if not isinstance(twin, Mapping):
+        twin = {}
+    twin_id = str(twin.get("id")) if twin.get("id") else None
+
+    lines: list[str] = []
+    rendered: set[str] = set()
+    for item in (similar.get("top") or [])[:3]:
+        if not isinstance(item, Mapping):
+            continue
+        item_id = str(item.get("id"))
+        rendered.add(item_id)
+        note = " — near twin" if twin_id is not None and item_id == twin_id else ""
+        lines.append(
+            "Most similar: "
+            + _insight_name(hub, item.get("kind"), item_id, item.get("name"))
+            + f" ({_insight_detail(item)}){note}"
+        )
+    if similar.get("near_twin") and twin_id is not None and twin_id not in rendered:
+        lines.append(
+            "Near twin: " + _insight_name(hub, twin.get("kind"), twin_id, twin.get("name"))
+        )
+    earlier = best.get("earlier_runs")
+    if isinstance(earlier, Mapping) and earlier.get("n") is not None:
+        lines.append(f"Earlier runs matched: {earlier.get('n')} ({earlier.get('basis')})")
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n\nAdvisory only; it never blocks Confirm."
+
+
 async def async_confirm_candidate(
     hub: Any, cand_id: str | None, raw_name: str, *, override: bool = False
 ) -> None:

@@ -115,6 +115,12 @@ from .engine.learning.budget import (
     update_ratio,
 )
 from .engine.learning.evidence import EVIDENCE_VERSION
+from .engine.learning.examples import (
+    EXAMPLE_MAX_COUNT,
+    ExampleSelection,
+    example_budget_bytes,
+    select_examples,
+)
 from .engine.learning.prompts import payload_bytes
 from .engine.learning.worker import SESSION_KEY_BASE, peak_memory_text
 from .engine.llm_wire import extract_json, model_matches
@@ -176,6 +182,7 @@ _REQUIRED_STAGE_OUTPUTS: dict[str, tuple[str, ...]] = {
     "compile_score": ("S", "conflict_share", "accepted"),
     "rescore": ("S", "conflict_share", "per_signature"),
     "refit": ("result", "accepted", "current_S", "new_S"),
+    "capture_refit": ("result", "n_devices"),
     "evidence": ("result",),
 }
 
@@ -243,6 +250,11 @@ class _RoundsState:
     rounds_run: int = 1
     refine_error: str | None = None
     proposal_empty: bool = False
+    # D-07: the captured-example eN -> capture_id map and the accepted round's
+    # optional per-example verdicts. Empty on a capture-free run or the shadow
+    # pass (with_examples False); the ids themselves ride the _async_ask calls.
+    example_id_map: dict[str, str] = dataclasses.field(default_factory=dict)
+    example_verdicts: list[Any] = dataclasses.field(default_factory=list)
 
 
 class LearningSupervisor:
@@ -273,6 +285,7 @@ class LearningSupervisor:
             "tokens_run": {"input": 0, "output": 0},
             "model_mismatch_run": None,
             "trimmed_run": 0,
+            "captures_left_out_run": 0,
             "month": {"key": None, "input": 0, "output": 0, "cost": None},
             "usable_days": {"value": 0.0, "computed_at": None},
         }
@@ -294,6 +307,10 @@ class LearningSupervisor:
         # evidence-free).
         self._device_evidence: dict[str, dict[str, Any]] = {}
         self._calibration: dict[str, dict[str, Any]] = {}
+        # D-07: the last successful production run's per-example verdicts, mapped
+        # from example id to capture id. Stored and shown on capture_list only;
+        # never read by candidate, preview or device logic.
+        self._capture_verdicts: dict[str, str] = {}
         self.run_task: asyncio.Task[Any] | None = None
         # Set synchronously while a run or rescore start is between its slot check and
         # the task assignment, which spans awaits (WR-09)
@@ -324,6 +341,7 @@ class LearningSupervisor:
             "tokens_run": data.get("tokens_run", {"input": 0, "output": 0}),
             "model_mismatch_run": data.get("model_mismatch_run"),
             "trimmed_run": data.get("trimmed_run", 0),
+            "captures_left_out_run": data.get("captures_left_out_run", 0),
             "month": data.get(
                 "month",
                 {"key": month_key(dt_util.now()), "input": 0, "output": 0, "cost": None},
@@ -333,6 +351,7 @@ class LearningSupervisor:
             "evidence_failures": getattr(self, "_evidence_failures", 0),
             "device_evidence": getattr(self, "_device_evidence", {}),
             "calibration": getattr(self, "_calibration", {}),
+            "capture_verdicts": getattr(self, "_capture_verdicts", {}),
         }
 
     @staticmethod
@@ -395,6 +414,7 @@ class LearningSupervisor:
                 "tokens_run",
                 "model_mismatch_run",
                 "trimmed_run",
+                "captures_left_out_run",
                 "month",
                 "usable_days",
                 "rescore_failures",
@@ -417,6 +437,12 @@ class LearningSupervisor:
                 stored_learning["calibration"], dict
             ):
                 self._calibration = dict(stored_learning["calibration"])
+            stored_capture_verdicts = stored_learning.get("capture_verdicts")
+            if isinstance(stored_capture_verdicts, dict):
+                self._capture_verdicts = {
+                    str(key): str(value)
+                    for key, value in stored_capture_verdicts.items()
+                }
 
             curr_month = month_key(dt_util.now())
             month_dict = c_data.get("month") or {}
@@ -1235,6 +1261,43 @@ class LearningSupervisor:
 
         return await self.hass.async_add_executor_job(_save_key_and_read_results)
 
+    def _round1_request(
+        self,
+        snapshot: RunSnapshot,
+        digest: Mapping[str, Any],
+        names: Mapping[str, str] | None,
+        *,
+        with_examples: bool = True,
+    ) -> tuple[dict[str, Any], ExampleSelection]:
+        """Build the one round-1 body shared by preview, consent prepare and the run.
+
+        D-06 (refined 2026-11-27): captures are read fresh from the capture manager at
+        every call and stay out of the cached worker digest and the prepare-cache key,
+        so the preview body is byte-identical to the run's first sent body. With no
+        captures (or ``with_examples=False``, the shadow pass) the body is
+        byte-identical to the capture-free request.
+        """
+        rows: list[dict[str, Any]] = []
+        captures = getattr(self.hub, "captures", None)
+        if with_examples and captures is not None:
+            rows = captures.example_rows()
+        selection = select_examples(
+            rows,
+            digest=digest,
+            names_flag=snapshot.names_flag,
+            max_bytes=example_budget_bytes(snapshot.caps.run_input),
+            max_count=EXAMPLE_MAX_COUNT,
+        )
+        body = prompts.build_request(
+            digest,
+            model=snapshot.model,
+            profile=snapshot.profile,
+            max_tokens=snapshot.max_tokens,
+            names=names,
+            examples=selection.text,
+        )
+        return body, selection
+
     async def async_preview_payload(self) -> dict[str, Any]:
         """Return the exact request body the next learning run will send."""
         base_url = self.entry.data.get(CONF_LLM_BASE_URL)
@@ -1265,13 +1328,7 @@ class LearningSupervisor:
             self._channel_rows_cache = channel_rows
             names = self._plug_names(meta, channel_rows)
 
-        body = prompts.build_request(
-            digest,
-            model=snapshot.model,
-            profile=snapshot.profile,
-            max_tokens=snapshot.max_tokens,
-            names=names,
-        )
+        body, selection = self._round1_request(snapshot, digest, names)
 
         n_bytes = payload_bytes(body)
         return {
@@ -1281,6 +1338,7 @@ class LearningSupervisor:
             "estimated_input_tokens": estimate_tokens(n_bytes),
             "max_tokens": snapshot.max_tokens,
             "entity_names_included": bool(names),
+            "captures_left_out": selection.left_out,
         }
 
     def visible_candidates(self) -> list[dict[str, Any]]:
@@ -1366,6 +1424,14 @@ class LearningSupervisor:
             return None
         validated = rec.get("validated")
         return bool(validated) if validated is not None else None
+
+    def display_name(self, candidate: dict[str, Any]) -> str:
+        """Public display name for a candidate (review insight re-resolution).
+
+        A thin public alias of ``_display_name`` so other modules do not couple to
+        the private name; the precedence rule itself is documented there.
+        """
+        return self._display_name(candidate)
 
     def _display_name(self, candidate: dict[str, Any]) -> str:
         """Display name without merge info: decision name, else label.
@@ -1465,7 +1531,11 @@ class LearningSupervisor:
                     "proposed_S": gate.get("proposed_S"),
                     "active_S": gate.get("active_S"),
                     "basis": gate.get("basis"),
-                    "reason": "worse_than_active",
+                    # D-10 gate scope: a capture-excluded gate that emptied the
+                    # validation block carries its own reason
+                    # (insufficient_validation); a capture-free gate carries no
+                    # reason key, so its record stays "worse_than_active".
+                    "reason": gate.get("reason") or "worse_than_active",
                 }
             else:
                 info = {
@@ -1477,6 +1547,191 @@ class LearningSupervisor:
                     "reason": "not_gated",
                 }
             await devices.async_record_rejected_proposal(dev_uuid, info)
+
+    def _capture_refit_devices(self) -> tuple[list[dict[str, Any]], str]:
+        """Build the capture_refit job devices and the snapshot (D-09/CAP-13).
+
+        A plain synchronous method (never a coroutine): the first statement
+        takes the snapshot time and the device capture list is read in the same
+        step with no await in between, so ``snapshot_at`` is never later than the
+        read (T-09-26). A capture is eligible for a device's refit when it is not
+        already in the active version's provenance ``capture_ids`` and its
+        ``resolved_at`` is not earlier than that version's
+        ``captures_snapshot_at`` (else its ``trained_at``); captures already in
+        the pending capture proposal's ``capture_ids`` are skipped, so a run whose
+        eligible captures are all already pending produces no entry at all
+        (D-09).
+
+        Returns ``(device entries, snapshot_at)``: one entry per device with at
+        least one new eligible capture, shaped for 09-05's capture_refit job.
+        """
+        snapshot_at = dt_util.utcnow().isoformat()
+        devices_mgr = getattr(self.hub, "devices", None)
+        captures = getattr(self.hub, "captures", None)
+        if devices_mgr is None or captures is None:
+            return [], snapshot_at
+        by_device = captures.clean_device_captures()
+        entries: list[dict[str, Any]] = []
+        for dev_uuid in sorted(by_device):
+            rec = devices_mgr.record(dev_uuid)
+            if rec is None or rec.get("status") != "confirmed":
+                continue
+            artefact, active_v = devices_mgr.active_artefact_and_version(dev_uuid)
+            if artefact is None:
+                continue
+            consumed: set[str] = set()
+            floor: str | None = None
+            for version in rec.get("versions") or []:
+                if not isinstance(version, Mapping) or version.get("v") != active_v:
+                    continue
+                prov = version.get("artefact")
+                prov = prov.get("provenance") if isinstance(prov, Mapping) else None
+                if isinstance(prov, Mapping):
+                    consumed = {str(c) for c in (prov.get("capture_ids") or [])}
+                    snap = prov.get("captures_snapshot_at")
+                    if isinstance(snap, str) and snap:
+                        floor = snap
+                if floor is None:
+                    trained = version.get("trained_at")
+                    if isinstance(trained, str) and trained:
+                        floor = trained
+                break
+            pending = rec.get("pending_proposal")
+            pending_ids: set[str] = set()
+            if isinstance(pending, Mapping):
+                pending_ids = {str(c) for c in (pending.get("capture_ids") or [])}
+            new_caps: list[dict[str, Any]] = []
+            for cap in by_device[dev_uuid]:
+                cid = str(cap.get("capture_id") or "")
+                if not cid or cid in consumed or cid in pending_ids:
+                    continue
+                resolved_at = cap.get("resolved_at")
+                if (
+                    floor is not None
+                    and isinstance(resolved_at, str)
+                    and resolved_at < floor
+                ):
+                    continue
+                new_caps.append(
+                    {
+                        "capture_id": cid,
+                        "rise_ms": cap.get("rise_ms"),
+                        "fall_ms": cap.get("fall_ms"),
+                        "features": cap.get("features"),
+                    }
+                )
+            if not new_caps:
+                continue
+            entries.append(
+                {
+                    "device_uuid": dev_uuid,
+                    "signature_id": str(rec.get("signature_id") or ""),
+                    "current": dict(artefact),
+                    "captures": new_caps,
+                }
+            )
+        return entries, snapshot_at
+
+    async def _async_capture_proposals(
+        self, stage_dir: Path, run_id: str, created: str, validated: bool
+    ) -> None:
+        """Run 09-05's capture_refit stage for the eligible device captures (D-09).
+
+        Called right after every ``_route_device_matches`` save, so a capture
+        proposal from this run supersedes an LLM one with the same run id (a
+        newer gated proposal wins, D-09). The device list is built by the
+        synchronous ``_capture_refit_devices`` (snapshot and read in one step,
+        T-09-26) and no job is written without an eligible capture. A gated
+        result becomes the device's pending proposal (source "capture", with its
+        capture ids and the snapshot); a worse_than_active or
+        insufficient_validation result is recorded as
+        ``validation.last_rejected_proposal`` with source "capture"; a
+        no_change or program_not_supported result logs at debug. The whole call
+        is isolated: a stage failure logs a warning and never fails or
+        fail-marks the learning run (T-09-18).
+        """
+        devices = getattr(self.hub, "devices", None)
+        captures = getattr(self.hub, "captures", None)
+        if devices is None or captures is None:
+            return
+        try:
+            entries, snapshot_at = self._capture_refit_devices()
+            if not entries:
+                return
+            job = {
+                "stage_dir": str(stage_dir),
+                "validated": bool(validated),
+                "captures_snapshot_at": snapshot_at,
+                "capture_windows": captures.holdout_windows(),
+                "devices": entries,
+            }
+            job_path = stage_dir / "capture_refit_job.json"
+
+            def _write_capture_job() -> None:
+                job_path.write_text(json.dumps(job, indent=2), encoding="utf-8")
+
+            await self.hass.async_add_executor_job(_write_capture_job)
+            res = _require_outputs(
+                "capture_refit",
+                await self._async_run_stage("capture_refit", job_path),
+            )
+            result_path = str(res["result"])
+
+            def _read_capture_result() -> dict[str, Any]:
+                with open(result_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+
+            result = await self.hass.async_add_executor_job(_read_capture_result)
+            now = dt_util.utcnow().isoformat()
+            for entry in result.get("devices", []):
+                dev_uuid = str(entry.get("device_uuid") or "")
+                if not dev_uuid:
+                    continue
+                reason = entry.get("reason")
+                if (
+                    reason == "gated"
+                    and entry.get("passed") is True
+                    and isinstance(entry.get("artefact"), Mapping)
+                ):
+                    # T-09-16: the artefact crosses the process boundary back only
+                    # through SignatureArtefact.from_dict; the gate verdict is
+                    # re-attached so the device menu reads one key for both origins.
+                    art = SignatureArtefact.from_dict(entry["artefact"]).to_dict()
+                    gate = entry["artefact"].get("proposal_gate")
+                    if isinstance(gate, Mapping):
+                        art["proposal_gate"] = dict(gate)
+                    await devices.async_set_proposal(
+                        dev_uuid,
+                        art,
+                        run_id=run_id,
+                        proposed_at=now,
+                        trained_at=created,
+                        source="capture",
+                        capture_ids=list(entry.get("capture_ids") or []),
+                        captures_snapshot_at=snapshot_at,
+                    )
+                elif reason in ("worse_than_active", "insufficient_validation"):
+                    await devices.async_record_rejected_proposal(
+                        dev_uuid,
+                        {
+                            "run_id": run_id,
+                            "rejected_at": now,
+                            "proposed_S": entry.get("proposed_S"),
+                            "active_S": entry.get("active_S"),
+                            "basis": entry.get("basis"),
+                            "reason": reason,
+                            "source": "capture",
+                        },
+                    )
+                elif reason in ("no_change", "program_not_supported"):
+                    _LOGGER.debug(
+                        "capture_refit for device %s: %s", dev_uuid, reason
+                    )
+        except Exception:  # noqa: BLE001 - a failing refit never fails the run
+            _LOGGER.warning(
+                "capture_refit stage failed; the learning run continues",
+                exc_info=True,
+            )
 
     def candidate_label(self, candidate: dict[str, Any], *, include_overlaps: bool = True) -> str:
         """Format candidate label for selector.
@@ -1853,13 +2108,7 @@ class LearningSupervisor:
                 self._channel_rows_cache = channel_rows
                 names = self._plug_names(meta, channel_rows)
 
-            body = prompts.build_request(
-                digest,
-                model=snapshot.model,
-                profile=snapshot.profile,
-                max_tokens=snapshot.max_tokens,
-                names=names,
-            )
+            body, _selection = self._round1_request(snapshot, digest, names)
             n_bytes = payload_bytes(body)
             tokens_str = str(estimate_tokens(n_bytes))
             bytes_str = str(n_bytes)
@@ -1922,6 +2171,7 @@ class LearningSupervisor:
         coord_data["tokens_run"] = {"input": 0, "output": 0}
         coord_data["model_mismatch_run"] = None
         coord_data["trimmed_run"] = 0
+        coord_data["captures_left_out_run"] = 0
         coord_data["blocked_reason"] = None
         coord_data["last_error"] = None
         # D-15a: persist the attempt start before any work, so one save records both
@@ -2055,8 +2305,19 @@ class LearningSupervisor:
                 # prompt (T-08-25).
                 capture_anchors=capture_anchors,
                 capture_prior_ids=capture_prior_ids,
+                # D-10 gate scope (Plan 09-06): every production compile round of
+                # a run whose captures carry a holdout window is judged on the
+                # capture-excluded table (round acceptance and the D-17 gate),
+                # so a captured run never judges what it informed.
+                capture_windows=(
+                    captures.holdout_windows() if captures is not None else []
+                ),
             )
             best_library = state.best_library
+            # D-07: map the accepted round's optional per-example verdicts (example
+            # id -> capture id) and store them. Read-only: nothing downstream may
+            # let a verdict change a candidate, a preview or a device.
+            self._capture_verdicts = self._map_capture_verdicts(state)
 
             if state.proposal_empty:
                 ended = dt_util.utcnow().isoformat()
@@ -2090,6 +2351,9 @@ class LearningSupervisor:
                 await self._route_device_matches(
                     candidates_record["candidates"], run_id, ended
                 )
+                await self._async_capture_proposals(
+                    stage_dir, run_id, ended, snapshot.validated
+                )
                 await self._candidates_store.async_save(candidates_record)
                 self.candidates = []
                 # Keep the in-memory record in sync with the store: the
@@ -2121,6 +2385,9 @@ class LearningSupervisor:
             self._apply_first_labels(candidates_record["candidates"])
             await self._route_device_matches(
                 candidates_record["candidates"], run_id, candidates_record["created"]
+            )
+            await self._async_capture_proposals(
+                stage_dir, run_id, candidates_record["created"], snapshot.validated
             )
             await self._candidates_store.async_save(candidates_record)
             self._candidates_record = candidates_record
@@ -2195,6 +2462,9 @@ class LearningSupervisor:
                     candidates_record["candidates"],
                     run_id,
                     candidates_record["created"],
+                )
+                await self._async_capture_proposals(
+                    stage_dir, run_id, candidates_record["created"], snapshot.validated
                 )
                 await self._candidates_store.async_save(candidates_record)
                 self._candidates_record = candidates_record
@@ -2416,6 +2686,8 @@ class LearningSupervisor:
         with_evidence: bool,
         capture_anchors: list[dict[str, Any]],
         capture_prior_ids: list[str],
+        capture_windows: list[list[int]],
+        with_examples: bool = True,
     ) -> None:
         """Run the shared R1 + refinement LLM rounds and compile scores.
 
@@ -2439,7 +2711,12 @@ class LearningSupervisor:
         to exactly True (Plan 07-01, D-11). ``capture_anchors`` and
         ``capture_prior_ids`` (CAP-09, Plan 08-08) ride the local compile job
         only — never a prompt — and only when non-empty, so a capture-free run
-        keeps a byte-identical job and output.
+        keeps a byte-identical job and output. ``capture_windows`` (D-10 gate
+        scope) rides the local compile job the same way: the production run
+        passes the captures manager's ``holdout_windows()`` (the run's captured
+        runs, the same set holdout validation excludes) and the shadow pass
+        passes ``[]``, so a compile round of a run with capture records is never
+        judged by a captured run and a capture-free job keeps its exact shape.
         """
         cluster_ids = [c["id"] for c in digest.get("clusters", [])]
         plug_ids = [p["id"] for p in digest.get("plugs", [])]
@@ -2447,24 +2724,31 @@ class LearningSupervisor:
             c["id"]: str(c.get("kind", "")) for c in digest.get("clusters", [])
         }
 
-        body = prompts.build_request(
-            digest,
-            model=snapshot.model,
-            profile=snapshot.profile,
-            max_tokens=snapshot.max_tokens,
-            names=names,
+        body, selection = self._round1_request(
+            snapshot, digest, names, with_examples=with_examples
         )
+        if with_examples:
+            state.example_id_map = dict(selection.id_map)
+            self._record_captures_left_out(selection.left_out)
 
         parsed_proposal = await self._async_ask(
             body,
             round_no=1,
-            digest_bytes=prompts.digest_payload_bytes(digest, names),
+            digest_bytes=prompts.digest_payload_bytes(
+                digest, names, examples=selection.text
+            ),
             cluster_ids=cluster_ids,
             plug_ids=plug_ids,
             cluster_kinds=cluster_kinds,
             snapshot=snapshot,
             stage_dir=stage_dir,
+            example_ids=selection.ids,
         )
+        # D-07: verdicts are popped before the proposal reaches the compile job or
+        # the refine `previous`; the run keeps the accepted round's list only.
+        parsed_proposal, verdicts = proposal.pop_example_verdicts(parsed_proposal)
+        if with_examples:
+            state.example_verdicts = list(verdicts)
 
         if not parsed_proposal.get("devices"):
             state.proposal_empty = True
@@ -2507,6 +2791,13 @@ class LearningSupervisor:
                 job_compile["capture_anchors"] = capture_anchors
             if capture_prior_ids:
                 job_compile["capture_prior_ids"] = capture_prior_ids
+            # D-10 gate scope (Plan 09-06): the run's capture windows reach every
+            # production compile round (this writer serves round 1 and every
+            # refinement round) so round acceptance and the D-17 gate read the
+            # capture-excluded table. A capture-free run writes no key, so its
+            # job keeps its exact shape (the trigger is holdout_windows()).
+            if capture_windows:
+                job_compile["capture_windows"] = capture_windows
             job_compile_path = stage_dir / f"job_compile_{round_num}.json"
             job_compile_path.write_text(
                 json.dumps(job_compile, indent=2), encoding="utf-8"
@@ -2543,6 +2834,16 @@ class LearningSupervisor:
         incumbent_proposal = parsed_proposal
         state.best_library = library_1
 
+        # D-10 gate scope (owner direction): round 1 never had an incumbent to
+        # beat, so its library stays the run's base library exactly as today —
+        # but every refinement round would be judged on the same emptied
+        # validation block and could never be accepted, so none is requested
+        # (no LLM cost for rounds that cannot count). The reason surfaces through
+        # the existing last_error path ("refinement stopped: ...").
+        if compile_out.get("reason") == "insufficient_validation":
+            state.refine_error = "insufficient_validation"
+            return
+
         for k in range(2, 2 + MAX_REFINE_ROUNDS):
             if not state.best_library:
                 break
@@ -2567,6 +2868,7 @@ class LearningSupervisor:
                 previous=incumbent_proposal,
                 scorecard=scorecard_data,
                 names=names,
+                examples=selection.text,
             )
 
             state.rounds_run = k
@@ -2574,12 +2876,15 @@ class LearningSupervisor:
                 proposal_k = await self._async_ask(
                     body_k,
                     round_no=k,
-                    digest_bytes=prompts.digest_payload_bytes(digest, names),
+                    digest_bytes=prompts.digest_payload_bytes(
+                        digest, names, examples=selection.text
+                    ),
                     cluster_ids=cluster_ids,
                     plug_ids=plug_ids,
                     cluster_kinds=cluster_kinds,
                     snapshot=snapshot,
                     stage_dir=stage_dir,
+                    example_ids=selection.ids,
                 )
             except LearningCapped:
                 raise
@@ -2623,6 +2928,12 @@ class LearningSupervisor:
             if not proposal_k.get("devices"):
                 continue
 
+            # D-07: pop the round's verdicts from the proposal so refine's
+            # `previous` never carries them. The adopted list is committed only
+            # in the acceptance branch below (WR-01), so a refinement round that
+            # is later rejected cannot overwrite the accepted round's verdicts.
+            proposal_k, verdicts_k = proposal.pop_example_verdicts(proposal_k)
+
             # A worker or file failure in a refinement round stops refining but keeps
             # the incumbent library the run already paid for (WR-03).
             try:
@@ -2640,6 +2951,13 @@ class LearningSupervisor:
                 library_k: list[dict[str, Any]] | None = None
                 if compile_out_k["accepted"] is True:
                     library_k = await self.hass.async_add_executor_job(_read_library, k)
+                if compile_out_k.get("reason") == "insufficient_validation":
+                    # D-10 gate scope: a refinement round judged on an emptied
+                    # block is never accepted (accepted is False above) and stops
+                    # refining; the incumbent library the run already paid for
+                    # stays. Capture-free outputs carry no reason key.
+                    state.refine_error = "insufficient_validation"
+                    break
             except LearningStageError as err:
                 state.refine_error = f"worker: {err}"
                 break
@@ -2648,6 +2966,11 @@ class LearningSupervisor:
                 break
 
             if library_k is not None:
+                # D-07 (WR-01): only an adopted (accepted) refinement round
+                # replaces the run's per-example verdicts, so a rejected round's
+                # list is never persisted or shown as the capture's llm_verdict.
+                if with_examples:
+                    state.example_verdicts = list(verdicts_k)
                 incumbent = {
                     "round": k,
                     "S": float(compile_out_k["S"]),
@@ -2794,6 +3117,14 @@ class LearningSupervisor:
                     # data (T-08-25).
                     capture_anchors=[],
                     capture_prior_ids=[],
+                    # D-10 gate scope (Plan 09-06): the masked pass sends no
+                    # examples and keeps full-block scoring, so it carries no
+                    # capture windows (its compile jobs keep no key).
+                    capture_windows=[],
+                    # 09-04: the masked validation pass is never the run whose
+                    # preview is shown, and its digest differs; it sends no
+                    # capture examples at all.
+                    with_examples=False,
                 )
 
             def _write_shadow_library() -> str:
@@ -3777,6 +4108,32 @@ class LearningSupervisor:
         c_data["trimmed_run"] = int(c_data.get("trimmed_run") or 0) + len(paths)
         self.coordinator.async_set_updated_data(c_data)
 
+    def _record_captures_left_out(self, left_out: int) -> None:
+        """Store how many eligible captures the example budget left out (D-08).
+
+        Set once per production run right after round 1 is built; the shadow pass
+        never calls this, so it cannot clear the production figure.
+        """
+        c_data = dict(self.coordinator.data)
+        c_data["captures_left_out_run"] = int(left_out)
+        self.coordinator.async_set_updated_data(c_data)
+
+    def _map_capture_verdicts(self, state: _RoundsState) -> dict[str, str]:
+        """Map the run's example verdicts (eN -> capture_id) to {capture_id: verdict}."""
+        mapped: dict[str, str] = {}
+        for entry in state.example_verdicts:
+            if not isinstance(entry, Mapping):
+                continue
+            capture_id = state.example_id_map.get(str(entry.get("example", "")))
+            verdict = entry.get("verdict")
+            if capture_id and verdict in proposal.EXAMPLE_VERDICTS:
+                mapped[str(capture_id)] = str(verdict)
+        return mapped
+
+    def capture_verdict(self, capture_id: str) -> str | None:
+        """The stored per-example LLM verdict for one capture, or None (D-07)."""
+        return self._capture_verdicts.get(str(capture_id))
+
     def _record_tokens(
         self,
         usage: Any,
@@ -3861,11 +4218,16 @@ class LearningSupervisor:
         snapshot: RunSnapshot,
         cluster_kinds: Mapping[str, str] | None = None,
         stage_dir: Path | None = None,
+        example_ids: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Request completion from LLM with classification, validation, repair, and salvage.
 
         digest_bytes is the escaped digest's share of body's payload bytes; repair turns
-        resend no digest and are checked with 0.
+        resend no digest and are checked with 0. ``example_ids`` lists the capture-example
+        ids the reply must answer; with the default the body is capture-free and every
+        code path is unchanged (D-07). The written proposal file never carries the
+        optional example_verdicts key, so the compile job and the prompt-refine
+        ``previous`` stay free of them.
         """
         if stage_dir is None:
             stage_dir = Path(self.hass.config.path(BUFFER_DIR, LEARNING_DIR)) / getattr(
@@ -3987,7 +4349,11 @@ class LearningSupervisor:
 
             parsed_obj, _ = extract_json(msg)
             parsed_proposal, errors, trimmed = proposal.parse_proposal(
-                msg, cluster_ids=cluster_ids, plug_ids=plug_ids, cluster_kinds=cluster_kinds
+                msg,
+                cluster_ids=cluster_ids,
+                plug_ids=plug_ids,
+                cluster_kinds=cluster_kinds,
+                example_ids=example_ids,
             )
             if parsed_obj is not None:
                 last_parsed_obj = parsed_obj
@@ -3996,10 +4362,15 @@ class LearningSupervisor:
 
             if not errors and parsed_proposal is not None:
                 self._record_trimmed(trimmed)
+                # D-07: the on-disk proposal is strip of the optional verdict list;
+                # the caller pops it from the returned dict to store it.
+                file_proposal = parsed_proposal
+                if example_ids:
+                    file_proposal, _ = proposal.pop_example_verdicts(parsed_proposal)
 
                 def _write_prop() -> None:
                     (stage_dir / f"proposal_{round_no}.json").write_text(
-                        json.dumps(parsed_proposal, indent=2), encoding="utf-8"
+                        json.dumps(file_proposal, indent=2), encoding="utf-8"
                     )
 
                 await self.hass.async_add_executor_job(_write_prop)
@@ -4014,6 +4385,7 @@ class LearningSupervisor:
                     plug_ids=plug_ids,
                     invalid_output=raw_text[:REPAIR_OUTPUT_MAX_CHARS],
                     errors=sorted(errors),
+                    example_ids=example_ids,
                 )
                 digest_bytes = 0
                 turn += 1
@@ -4027,14 +4399,20 @@ class LearningSupervisor:
                     cluster_ids=cluster_ids,
                     plug_ids=plug_ids,
                     cluster_kinds=cluster_kinds,
+                    example_ids=example_ids,
                 )
                 if salvaged is not None:
                     salvaged_proposal, _ = salvaged
                     self._record_trimmed(last_trimmed)
+                    file_salvaged = salvaged_proposal
+                    if example_ids:
+                        file_salvaged, _ = proposal.pop_example_verdicts(
+                            salvaged_proposal
+                        )
 
                     def _write_salvaged() -> None:
                         (stage_dir / f"proposal_{round_no}.json").write_text(
-                            json.dumps(salvaged_proposal, indent=2), encoding="utf-8"
+                            json.dumps(file_salvaged, indent=2), encoding="utf-8"
                         )
 
                     await self.hass.async_add_executor_job(_write_salvaged)

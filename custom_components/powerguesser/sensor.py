@@ -28,7 +28,13 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 from . import PowerGuesserConfigEntry
-from .const import CONF_LLM_MODEL, CONF_LLM_PROBE, DOMAIN, SIGNAL_PROFILE_SOURCES
+from .const import (
+    CONF_LLM_MODEL,
+    CONF_LLM_PROBE,
+    DOMAIN,
+    SIGNAL_CAPTURE_UPDATED,
+    SIGNAL_PROFILE_SOURCES,
+)
 from .engine.intervals import ProfileSnapshot, ProfileSource, SourceProfile
 from .engine.llm_wire import model_matches
 from .engine.model import Snapshot
@@ -347,6 +353,7 @@ class LearningStatusSensor(
             "last_attempt_outcome",
             "model_mismatch_this_run",
             "trimmed_this_run",
+            "captures_left_out_this_run",
         }
     )
 
@@ -451,7 +458,61 @@ class LearningStatusSensor(
             "llm_model_returned": llm_model_returned,
             "model_mismatch_this_run": data.get("model_mismatch_run"),
             "trimmed_this_run": data.get("trimmed_run", 0),
+            "captures_left_out_this_run": data.get("captures_left_out_run", 0),
         }
+
+
+class CaptureStatusSensor(SensorEntity):
+    """Hub-level enum sensor reporting the live capture state (CAP-07, D-03).
+
+    A plain ``SensorEntity`` (no coordinator): it derives its state from
+    ``hub.captures.status_view()`` and refreshes through the manager's
+    ``SIGNAL_CAPTURE_UPDATED`` dispatcher signal. The state changes only on
+    capture transitions; no attribute ticks.
+    """
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_translation_key = "capture_status"
+    _attr_unique_id = "powerguesser_capture_status"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["idle", "recording", "resolving"]
+    _unrecorded_attributes = frozenset(
+        {"capture_id", "target_name", "started_at", "last_result"}
+    )
+
+    def __init__(self, hub: Any, entry: PowerGuesserConfigEntry) -> None:
+        """Initialize the capture status sensor."""
+        self.hub = hub
+        self._entry_id = entry.entry_id
+        self._attr_device_info = _device_info()
+
+    @property
+    def native_value(self) -> str:
+        """Return the capture state (idle, recording or resolving)."""
+        return self.hub.captures.status_view()["state"]
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the open capture's volatile attributes and the last result."""
+        view = self.hub.captures.status_view()
+        return {
+            "capture_id": view["capture_id"],
+            "target_kind": view["target_kind"],
+            "target_name": view["target_name"],
+            "started_at": view["started_at"],
+            "last_result": view["last_result"],
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to capture state changes."""
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                f"{SIGNAL_CAPTURE_UPDATED}_{self._entry_id}",
+                self.async_write_ha_state,
+            )
+        )
 
 
 def _device_model(hub: Any, device_uuid: str) -> str:
@@ -802,6 +863,7 @@ async def async_setup_entry(
         BootstrappedUsableHistorySensor(hub.bootstrap_coordinator),
         LearningStatusSensor(hub.learning.coordinator, entry),
         DetectionTimingSensor(hub),
+        CaptureStatusSensor(hub, entry),
     ]
     known_sources: set[str] = set()
     for source in hub.profile_sources.values():

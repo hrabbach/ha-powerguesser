@@ -7,7 +7,9 @@ import re
 import pytest
 
 from custom_components.powerguesser.engine.learning.prompts import (
+    EXAMPLES_RULE,
     PROPOSAL_SCHEMA,
+    PROPOSAL_SCHEMA_EXAMPLES,
     STATIC_PREFIX,
     build_refine_request,
     build_repair_request,
@@ -233,3 +235,122 @@ def test_ha_side_learning_modules_avoid_numpy_scipy():
                 mod = node.module or ""
                 assert "numpy" not in mod, f"{fpath} imports from numpy via 'from {mod}'"
                 assert "scipy" not in mod, f"{fpath} imports from scipy via 'from {mod}'"
+
+
+EXAMPLE_BLOCK = "\n".join(
+    [
+        "<examples>",
+        "e1 t=t1 q=clean rise=2010 fall=-2000 dur_min=3.0 wh=100.0 hour=7 dow=2 cluster=c01",
+        "</examples>",
+    ]
+)
+
+
+def test_examples_rule_and_schema_only_with_examples(sample_digest):
+    """With no examples the body is unchanged; with a block the rule and examples schema are added."""
+    profile = {"strategy": Strategy.JSON_SCHEMA.value, "token_param": "max_completion_tokens", "send_temperature": True}
+
+    default = build_request(sample_digest, model="m", profile=profile, max_tokens=4000)
+    empty = build_request(sample_digest, model="m", profile=profile, max_tokens=4000, examples="")
+    assert json.dumps(default, sort_keys=True) == json.dumps(empty, sort_keys=True)
+    assert default["messages"][0]["content"] == STATIC_PREFIX
+
+    body = build_request(
+        sample_digest,
+        model="m",
+        profile=profile,
+        max_tokens=4000,
+        names={"p1": "Kettle"},
+        examples=EXAMPLE_BLOCK,
+    )
+
+    sys_msg = body["messages"][0]["content"]
+    assert sys_msg == f"{STATIC_PREFIX}\n\n{EXAMPLES_RULE}"
+    user_msg = body["messages"][1]["content"]
+    assert EXAMPLE_BLOCK in user_msg
+    assert user_msg.endswith("Return the proposal as specified.")
+
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert "example_verdicts" in schema["properties"]
+    assert "example_verdicts" in schema["required"]
+    assert schema["properties"]["example_verdicts"]["items"]["properties"]["verdict"]["enum"] == [
+        "consistent",
+        "inconsistent",
+        "cannot_tell",
+    ]
+
+    # The capture-free schema is untouched by building the examples variant.
+    assert "example_verdicts" not in PROPOSAL_SCHEMA["properties"]
+    assert "example_verdicts" not in PROPOSAL_SCHEMA["required"]
+    assert PROPOSAL_SCHEMA_EXAMPLES is not PROPOSAL_SCHEMA
+
+
+def test_digest_payload_bytes_counts_examples(sample_digest):
+    """digest_payload_bytes counts the escaped example block inside the payload."""
+    profile = {"strategy": Strategy.JSON_SCHEMA.value, "token_param": "max_completion_tokens", "send_temperature": True}
+    names = {"p1": "Küche Wäschetrockner"}
+
+    base = digest_payload_bytes(sample_digest, names)
+    with_examples = digest_payload_bytes(sample_digest, names, examples=EXAMPLE_BLOCK)
+    rendered = render_digest(sample_digest, names, examples=EXAMPLE_BLOCK)
+    escaped = json.dumps(rendered, ensure_ascii=False)[1:-1]
+
+    assert f"\n{EXAMPLE_BLOCK}" in rendered
+    assert with_examples == len(escaped.encode("utf-8"))
+    assert with_examples > base
+
+    body = build_request(
+        sample_digest,
+        model="m",
+        profile=profile,
+        max_tokens=4000,
+        names=names,
+        examples=EXAMPLE_BLOCK,
+    )
+    compact = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    assert escaped in compact
+    assert with_examples < payload_bytes(body)
+
+
+def test_repair_request_lists_example_ids():
+    """The repair turn carries the ids, the rule and the examples schema when example ids are sent."""
+    profile = {"strategy": Strategy.JSON_SCHEMA.value, "token_param": "max_completion_tokens", "send_temperature": True}
+
+    default = build_repair_request(
+        model="m",
+        profile=profile,
+        max_tokens=4000,
+        cluster_ids=["c01"],
+        plug_ids=["p1"],
+        invalid_output="{}",
+        errors=["/devices: expected array"],
+    )
+    without = build_repair_request(
+        model="m",
+        profile=profile,
+        max_tokens=4000,
+        cluster_ids=["c01"],
+        plug_ids=["p1"],
+        invalid_output="{}",
+        errors=["/devices: expected array"],
+        example_ids=(),
+    )
+    assert json.dumps(default, sort_keys=True) == json.dumps(without, sort_keys=True)
+    assert default["messages"][0]["content"] == STATIC_PREFIX
+
+    body = build_repair_request(
+        model="m",
+        profile=profile,
+        max_tokens=4000,
+        cluster_ids=["c01"],
+        plug_ids=["p1"],
+        invalid_output="{}",
+        errors=["/example_verdicts/0: unknown verdict"],
+        example_ids=("e1", "e2"),
+    )
+    user_msg = body["messages"][1]["content"]
+    assert "Valid plug ids: p1\nValid example ids: e1, e2\n" in user_msg
+    assert body["messages"][0]["content"] == f"{STATIC_PREFIX}\n\n{EXAMPLES_RULE}"
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert "example_verdicts" in schema["properties"]
+    assert "example_verdicts" in schema["required"]

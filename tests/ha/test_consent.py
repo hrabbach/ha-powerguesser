@@ -76,6 +76,7 @@ async def test_preview_returns_body_without_key(
         "estimated_input_tokens",
         "max_tokens",
         "entity_names_included",
+        "captures_left_out",
     }
     assert set(response.keys()) == expected_keys
     assert response["url"] == "http://llm.test/v1/chat/completions"

@@ -79,6 +79,15 @@ REPLAY_PRE_ROLL_S = 600
 # INITIAL VALUE: at most this many capture records are retained (Pitfall 8).
 MAX_CAPTURE_RECORDS = 200
 
+# --- Insight (Plan 09-02, D-11/D-12) ---
+# INITIAL VALUE: how many most-similar candidates/devices a capture shows. This
+# is the DISPLAY list only: the near-twin flag is computed over the full scored
+# pool, never this list (D-11).
+SIMILAR_TOP_K = 3
+# INITIAL VALUE: how far back of the captured rise the earlier-runs replay looks,
+# clipped to the buffer (D-12).
+EARLIER_RUNS_LOOKBACK_DAYS = 28
+
 # --- Vocabularies ---
 # INITIAL VALUE: every capture record state (Pattern 2; OPEN_STATES is its
 # subset that survives only in memory).

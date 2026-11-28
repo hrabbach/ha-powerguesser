@@ -1,6 +1,7 @@
 """Config flow for PowerGuesser integration."""
 
 import asyncio
+from collections.abc import Mapping
 from datetime import datetime
 import logging
 from typing import Any
@@ -15,7 +16,14 @@ from homeassistant.config_entries import (
     OptionsFlow,
 )
 from homeassistant.core import CoreState, callback
-from homeassistant.helpers import entity_registry as er, issue_registry as ir, selector
+from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import (
+    config_validation as cv,
+    entity_registry as er,
+    issue_registry as ir,
+    selector,
+)
+from homeassistant.helpers.translation import async_get_translations
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -96,6 +104,14 @@ def _escape_markdown(text: str) -> str:
     return "".join(out)
 
 
+def _format_score(value: Any) -> str:
+    """Render a validation-day score for the device menu, or its raw value."""
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _as_iso_utc(value: Any) -> str | None:
     """Normalise a DateTimeSelector value to an ISO 8601 UTC string, or None."""
     if value is None or value == "":
@@ -107,6 +123,71 @@ def _as_iso_utc(value: Any) -> str | None:
     if parsed is None:
         return None
     return dt_util.as_utc(parsed).isoformat()
+
+
+def _parse_local(value: Any) -> datetime | None:
+    """Parse a stored ISO timestamp (or a datetime) for local display, or None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = dt_util.parse_datetime(str(value))
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt_util.get_default_time_zone())
+    return parsed.astimezone(dt_util.get_default_time_zone())
+
+
+def _local_clock(value: Any) -> str:
+    """A stored timestamp as a local HH:MM clock time, or ""."""
+    parsed = _parse_local(value)
+    return parsed.strftime("%H:%M") if parsed is not None else ""
+
+
+def _local_stamp(value: Any) -> str:
+    """A stored timestamp as a local YYYY-MM-DD HH:MM stamp, or "unknown time"."""
+    parsed = _parse_local(value)
+    return parsed.strftime("%Y-%m-%d %H:%M") if parsed is not None else "unknown time"
+
+
+# The read-only "Recent captures" attachment phrases (D-10, Plan 09-07).
+_ATTACHED_PHRASES = {
+    "preview": "teaches its preview",
+    "candidate_example": "an example of the candidate",
+    "device_example": "trains the device's next update proposal",
+    "not_teaching": "kept as a labelled example; does not teach",
+    "target_gone": "target no longer exists: reassign or delete",
+}
+
+# The Capture form's "new device" target value, distinct from the
+# ``candidate_<sig>`` / ``device_<uuid>`` option values.
+_CAPTURE_NEW_DEVICE = "new_device"
+
+
+def _capture_w(value: Any) -> str:
+    """A step power as ``<W> W``, or ``n/a``."""
+    try:
+        return f"{round(float(value))} W"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _capture_min(value: Any) -> str:
+    """A duration in seconds as ``<min> min``, or ``n/a``."""
+    try:
+        return f"{round(float(value) / 60)} min"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _capture_wh(value: Any) -> str:
+    """An energy in Wh as ``<Wh> Wh``, or ``n/a``."""
+    try:
+        return f"{round(float(value))} Wh"
+    except (TypeError, ValueError):
+        return "n/a"
 
 
 class PowerGuesserConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -236,6 +317,7 @@ class PowerGuesserOptionsFlow(OptionsFlow):
         self._candidate_id: str | None = None
         self._device_uuid: str | None = None
         self._review_errors: dict[str, str] = {}
+        self._capture_result: str = ""
 
     def _get_grid_device_sensors(self) -> str:
         """Find power sensors on the grid meter's device as suggestions."""
@@ -277,7 +359,10 @@ class PowerGuesserOptionsFlow(OptionsFlow):
 
         return self.async_show_menu(
             step_id="init",
-            menu_options=["phases", "llm_endpoint", "learning", "review", "plug_sessions"],
+            menu_options=[
+                "phases", "llm_endpoint", "learning", "review",
+                "plug_sessions", "capture",
+            ],
         )
 
     # -- Plug sessions (REV-04, Plan 06-06 D-09..D-12, D-15) ----------------
@@ -573,6 +658,396 @@ class PowerGuesserOptionsFlow(OptionsFlow):
             step_id="session_list",
             data_schema=vol.Schema({}),
             description_placeholders={"sessions": _escape_markdown(text)},
+        )
+
+    # -- Capture (CAP-08, CAP-11, CAP-12; D-04, D-10..D-12) -----------------
+
+    def _capture_manager(self) -> Any:
+        """Return the capture manager, or None while PowerGuesser is not loaded."""
+        hub = getattr(self.config_entry, "runtime_data", None)
+        if hub is None:
+            return None
+        return getattr(hub, "captures", None)
+
+    @staticmethod
+    def _append_insight(base: str, text: str) -> str:
+        """Append the markdown-escaped capture insight to a placeholder (D-11).
+
+        Keeps the existing block untouched; prefixes two newlines so the insight
+        is its own markdown paragraph (or returns ``base`` unchanged when there
+        is no insight).
+        """
+        if not text:
+            return base
+        return base + "\n\n" + _escape_markdown(text)
+
+    def _capture_status_text(self, hub: Any) -> str:
+        """The Capture menu's status line, plus the last action result (D-04)."""
+        status = hub.captures.status_view()
+        state = str(status.get("state") or "idle")
+        target = status.get("target_name") or "the capture"
+        if state == "recording":
+            clock = _local_clock(status.get("started_at"))
+            base = (
+                f"Recording since {clock} for {target}."
+                if clock
+                else f"Recording for {target}."
+            )
+        elif state == "resolving":
+            base = (
+                f"Resolving the capture for {target}; the result appears in "
+                "about 2-3 minutes."
+            )
+        else:
+            base = "No capture is running."
+        if self._capture_result:
+            return f"{base}\n\n{self._capture_result}"
+        return base
+
+    async def _refusal_text(self, err: ServiceValidationError) -> str:
+        """Render a capture refusal in the user's own language (never waiting).
+
+        Returns the message *unescaped*. A caller that puts the result straight
+        into a markdown-rendered description placeholder escapes it with
+        ``_escape_markdown`` (WR-03: the messages embed LLM-derived candidate
+        names in ``{choices}``); the ``_capture_result`` path stores it raw and is
+        escaped once when the Capture menu renders it.
+
+        HA's ``async_get_exception_message`` is English-only (it resolves against
+        the ``"en"`` cache) and HA always caches English as the fallback base, so
+        the message is read here from the configured locale with an English
+        fallback. A cold cache or a locale without the key falls back to the raw
+        translation key, exactly as the helper did.
+        """
+        key = str(err.translation_key or "")
+        if not key:
+            return str(err)
+        placeholders = dict(err.translation_placeholders or {})
+        localize_key = f"component.{DOMAIN}.exceptions.{key}.message"
+        for language in dict.fromkeys((self.hass.config.language or "en", "en")):
+            try:
+                # Warm the exceptions category for this language, then read the
+                # message the helper would have returned (minus its English bias).
+                translations = await async_get_translations(
+                    self.hass, language, "exceptions", [DOMAIN]
+                )
+            except Exception:  # noqa: BLE001 - a translation failure must not break the menu
+                continue
+            message = translations.get(localize_key)
+            if not message:
+                continue
+            message = message.rstrip(".")
+            if not placeholders:
+                return message
+            try:
+                return message.format(**placeholders)
+            except (KeyError, IndexError, ValueError):
+                return message
+        return key
+
+    def _capture_target_choice(
+        self, hub: Any, target_value: str, name: str
+    ) -> tuple[str, str, str] | None:
+        """Resolve a Capture form's target to ``(target_type, target, label)``.
+
+        A ``new_device`` needs a valid name (``ValueError`` -> ``name_invalid``);
+        a candidate or device stores the target's *user-supplied* name, else the
+        signature id, as the label (D-05 owner revision: the decorated option
+        text, an LLM label or a placeholder is never stored as a label). Returns
+        ``None`` when a rendered candidate/device option no longer resolves.
+        """
+        if target_value == _CAPTURE_NEW_DEVICE:
+            norm = normalise_name(name)
+            return ("new_device", norm, norm)
+        kind, ident = self._parse_session_target(target_value)
+        if kind is None:
+            return None
+        if kind == "candidate":
+            dec = hub.learning.review.decisions.get(ident) or {}
+            label = dec.get("name")
+        else:
+            rec = hub.devices.record(ident)
+            label = (rec or {}).get("name")
+        return (kind, ident, str(label) if label else ident)
+
+    def _capture_target_options(self) -> list[selector.SelectOptionDict]:
+        """The Capture target choices: New device, then candidates and devices."""
+        options = [
+            selector.SelectOptionDict(
+                value=_CAPTURE_NEW_DEVICE, label="New device (name below)"
+            )
+        ]
+        options.extend(self._session_targets())
+        return options
+
+    def _capture_target_selector(self) -> Any:
+        return selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=self._capture_target_options(),
+                mode=selector.SelectSelectorMode.LIST,
+            )
+        )
+
+    def _capture_entry_lines(self, entry: Any) -> list[str]:
+        """The markdown lines for one capture's list_view entry (D-10..D-12)."""
+        result = entry.get("result")
+        if not isinstance(result, Mapping):
+            result = {}
+        target = entry.get("target")
+        name = (target or {}).get("name") or "a target that no longer exists"
+        when = _local_stamp((entry.get("window") or {}).get("start_local"))
+        state = str(entry.get("state") or "")
+        verdict = result.get("verdict")
+        # A capture that is not done (recording/resolving/interrupted) carries no
+        # result, so render a friendly placeholder instead of interpolating None.
+        verdict_text = str(verdict) if verdict is not None else "no verdict"
+        lines = [
+            "- "
+            + f"{when} — {name} — {state}, {verdict_text}: "
+            + f"{_capture_w(result.get('step_w'))}, "
+            + f"{_capture_min(result.get('dur_s'))}, "
+            + f"{_capture_wh(result.get('energy_wh'))} — "
+            + _ATTACHED_PHRASES.get(
+                str(entry.get("attached_as") or ""),
+                str(entry.get("attached_as") or ""),
+            )
+        ]
+        similar = result.get("similar")
+        if not isinstance(similar, Mapping):
+            similar = {}
+        twin = similar.get("twin")
+        if not isinstance(twin, Mapping):
+            twin = {}
+        twin_id = str(twin.get("id")) if twin.get("id") else None
+        rendered: set[str] = set()
+        for item in (similar.get("top") or [])[:3]:
+            if not isinstance(item, Mapping):
+                continue
+            item_id = str(item.get("id"))
+            rendered.add(item_id)
+            note = ", near twin" if twin_id is not None and item_id == twin_id else ""
+            lines.append(f"  Most similar: {item.get('name')} ({item.get('score')}){note}")
+        if similar.get("near_twin") and twin_id is not None and twin_id not in rendered:
+            lines.append(f"  Near twin: {twin.get('name')}")
+        earlier = entry.get("earlier_runs")
+        if isinstance(earlier, Mapping) and earlier.get("n") is not None:
+            lines.append(
+                f"  Earlier runs matched: {earlier.get('n')} ({earlier.get('basis')})"
+            )
+        llm = entry.get("llm_verdict")
+        if llm:
+            lines.append(f"  LLM: {llm}")
+        # D-10: a non-clean device capture never trains the device.
+        if (
+            entry.get("target_kind") == "device"
+            and entry.get("target_state") == "ok"
+            and verdict != "clean"
+        ):
+            lines.append("  Not used to retrain the device (only clean captures train)")
+        replay = entry.get("replay")
+        if isinstance(replay, Mapping):
+            if replay.get("would_claim"):
+                lines.append(
+                    "  Replay check (evidence only): the active version alone "
+                    "would have claimed this run"
+                )
+            else:
+                lines.append(
+                    "  Replay check (evidence only): the active version alone "
+                    "would not have claimed this run"
+                )
+        return lines
+
+    def _capture_lines(self, hub: Any, limit: int = 10) -> list[str]:
+        """The newest ``limit`` captures, newest first, as markdown lines (D-11)."""
+        entries = list(reversed(hub.captures.list_view()))[:limit]
+        lines: list[str] = []
+        for entry in entries:
+            lines.extend(self._capture_entry_lines(entry))
+        return lines
+
+    async def async_step_capture(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """The Capture menu: Start, Stop (while recording), Retro and Recent (D-04)."""
+        hub = getattr(self.config_entry, "runtime_data", None)
+        captures = getattr(hub, "captures", None) if hub is not None else None
+        if captures is None:
+            return self.async_abort(reason="not_loaded")
+
+        menu_opts = ["capture_start"]
+        if captures.status_view().get("state") == "recording":
+            menu_opts.append("capture_stop")
+        menu_opts.extend(["capture_retro", "capture_recent"])
+        status_text = _escape_markdown(self._capture_status_text(hub))
+        # D-04: the last action result ("Recording started for X."/"Stopped. …")
+        # belongs to the menu return that immediately follows the action; clear it
+        # once shown so a later Capture visit does not keep re-rendering it.
+        self._capture_result = ""
+        return self.async_show_menu(
+            step_id="capture",
+            menu_options=menu_opts,
+            description_placeholders={"status": status_text},
+        )
+
+    async def async_step_capture_start(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Start a live capture and return at once, never waiting (D-04)."""
+        hub = getattr(self.config_entry, "runtime_data", None)
+        captures = getattr(hub, "captures", None) if hub is not None else None
+        if captures is None:
+            return self.async_abort(reason="not_loaded")
+
+        errors: dict[str, str] = {}
+        refusal = ""
+        if user_input is not None:
+            try:
+                choice = self._capture_target_choice(
+                    hub,
+                    str(user_input.get("target") or ""),
+                    str(user_input.get("name") or ""),
+                )
+            except ValueError:
+                errors["base"] = "name_invalid"
+            else:
+                if choice is None:
+                    errors["base"] = "target_gone"
+                else:
+                    target_type, target, label = choice
+                    try:
+                        await captures.async_start(
+                            label=label, target_type=target_type, target=target
+                        )
+                    except ServiceValidationError as err:
+                        errors["base"] = "capture_refused"
+                        refusal = _escape_markdown(await self._refusal_text(err))
+                    else:
+                        self._capture_result = f"Recording started for {label}."
+                        return await self.async_step_capture()
+
+        schema = vol.Schema(
+            {
+                vol.Required("target"): self._capture_target_selector(),
+                vol.Optional("name"): selector.TextSelector(),
+            }
+        )
+        return self.async_show_form(
+            step_id="capture_start",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders={"refusal": refusal},
+        )
+
+    async def async_step_capture_stop(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Stop the live capture and return to the menu at once (D-04)."""
+        hub = getattr(self.config_entry, "runtime_data", None)
+        captures = getattr(hub, "captures", None) if hub is not None else None
+        if captures is None:
+            return self.async_abort(reason="not_loaded")
+
+        try:
+            await captures.async_stop()
+        except ServiceValidationError as err:
+            self._capture_result = await self._refusal_text(err)
+        else:
+            self._capture_result = (
+                "Stopped. The result appears under Recent captures and on the "
+                "Capture status sensor in about 2-3 minutes."
+            )
+        return await self.async_step_capture()
+
+    async def async_step_capture_recent(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """List the newest captures with their insight (read-only, D-11)."""
+        hub = getattr(self.config_entry, "runtime_data", None)
+        captures = getattr(hub, "captures", None) if hub is not None else None
+        if captures is None:
+            return self.async_abort(reason="not_loaded")
+
+        if user_input is not None:
+            return await self.async_step_capture()
+
+        lines = self._capture_lines(hub)
+        text = "\n".join(lines) if lines else "There are no captures yet."
+        return self.async_show_form(
+            step_id="capture_recent",
+            data_schema=vol.Schema({}),
+            description_placeholders={"captures": _escape_markdown(text)},
+        )
+
+    async def async_step_capture_retro(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Capture a past run from the menu; Submit commits and returns (D-04)."""
+        hub = getattr(self.config_entry, "runtime_data", None)
+        captures = getattr(hub, "captures", None) if hub is not None else None
+        if captures is None:
+            return self.async_abort(reason="not_loaded")
+
+        errors: dict[str, str] = {}
+        refusal = ""
+        if user_input is not None:
+            # The DateTimeSelector rejects malformed values before the handler
+            # runs, but a submitted value outside it can still fail to parse: that
+            # is an invalid window, not an invalid name, so report it on the field
+            # rather than as name_invalid.
+            try:
+                start = cv.datetime(user_input.get("start"))
+            except vol.Invalid:
+                errors["start"] = "invalid_datetime"
+            try:
+                end = cv.datetime(user_input.get("end"))
+            except vol.Invalid:
+                errors["end"] = "invalid_datetime"
+
+            if not errors:
+                try:
+                    choice = self._capture_target_choice(
+                        hub,
+                        str(user_input.get("target") or ""),
+                        str(user_input.get("name") or ""),
+                    )
+                except ValueError:
+                    errors["base"] = "name_invalid"
+                else:
+                    if choice is None:
+                        errors["base"] = "target_gone"
+                    else:
+                        target_type, target, label = choice
+                        try:
+                            entry = await captures.async_capture_window(
+                                start=start,
+                                end=end,
+                                label=label,
+                                target_type=target_type,
+                                target=target,
+                            )
+                        except ServiceValidationError as err:
+                            errors["base"] = "capture_refused"
+                            refusal = _escape_markdown(await self._refusal_text(err))
+                        else:
+                            self._capture_result = "\n".join(
+                                self._capture_entry_lines(entry)
+                            )
+                            return await self.async_step_capture()
+
+        schema = vol.Schema(
+            {
+                vol.Required("start"): selector.DateTimeSelector(),
+                vol.Required("end"): selector.DateTimeSelector(),
+                vol.Required("target"): self._capture_target_selector(),
+                vol.Optional("name"): selector.TextSelector(),
+            }
+        )
+        return self.async_show_form(
+            step_id="capture_retro",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders={"refusal": refusal},
         )
 
     async def async_step_phases(
@@ -1163,6 +1638,56 @@ class PowerGuesserOptionsFlow(OptionsFlow):
             None,
         )
 
+    def _proposal_text(self, hub: Any, uuid: str) -> str:
+        """The pending-proposal block of the device menu (D-09, D-10).
+
+        Names where a pending update comes from — the user's captures (with the
+        captured-run count) or a learning run — and the gate's validation-day
+        scores with the no-regression basis. Below it: how many captured runs of
+        this device do not train because they are not clean (D-10), and the
+        Phase 8 replay check as an evidence-only line (D-10). Empty when nothing
+        applies; otherwise markdown-escaped and prefixed with two newlines so it
+        follows the evidence block.
+        """
+        devices = getattr(hub, "devices", None)
+        captures = getattr(hub, "captures", None)
+        rec = devices.record(uuid) if devices is not None else None
+        lines: list[str] = []
+        pending = rec.get("pending_proposal") if isinstance(rec, dict) else None
+        if isinstance(pending, dict):
+            if pending.get("source") == "capture":
+                n_runs = len(pending.get("capture_ids") or [])
+                noun = "run" if n_runs == 1 else "runs"
+                lines.append(f"Update available from your captures ({n_runs} captured {noun})")
+            else:
+                lines.append("Update available from a learning run")
+            artefact = pending.get("artefact")
+            gate = artefact.get("proposal_gate") if isinstance(artefact, dict) else None
+            if isinstance(gate, dict):
+                lines.append(
+                    "Validation-day score: proposed "
+                    f"{_format_score(gate.get('proposed_S'))} vs active "
+                    f"{_format_score(gate.get('active_S'))} — {gate.get('basis')}"
+                )
+        counts = (
+            captures.device_capture_counts(uuid) if captures is not None else None
+        )
+        if counts is not None:
+            if counts.get("not_clean"):
+                lines.append(
+                    f"{counts['not_clean']} captured runs on this device are not "
+                    "used for retraining (only clean captures train)."
+                )
+            if counts.get("replay_checked"):
+                lines.append(
+                    "Replay check (evidence only): the active version alone would have claimed "
+                    f"{counts['replay_claimed']} of {counts['replay_checked']} "
+                    "checked captured runs; it does not decide whether an update is proposed."
+                )
+        if not lines:
+            return ""
+        return "\n\n" + _escape_markdown("\n\n".join(lines))
+
     @staticmethod
     def _device_merge_sources(hub: Any, dev_uuid: str) -> list[dict[str, Any]]:
         """Merge sources for a confirmed device (D-12, D-13, D-23, C3, D-40).
@@ -1230,7 +1755,17 @@ class PowerGuesserOptionsFlow(OptionsFlow):
                 "candidate": _escape_markdown(hub.learning.candidate_label(entry)),
                 # D-07a: the same block as a candidate, replayed from the
                 # device's active artefact (or the "n/a" block without one).
-                "evidence": review_actions.evidence_text(evidence, state),
+                # D-11/D-12 (Plan 09-07): the stored capture insight follows it,
+                # advisory only, before the {proposal} block.
+                "evidence": self._append_insight(
+                    review_actions.evidence_text(evidence, state),
+                    review_actions.capture_insight_text(
+                        hub, "device", str(self._device_uuid or "")
+                    ),
+                ),
+                # D-09/D-10 (Plan 09-06): where a pending update comes from, how
+                # it scored, which captures do not train and the replay evidence.
+                "proposal": self._proposal_text(hub, self._device_uuid),
             },
         )
 
@@ -1352,7 +1887,13 @@ class PowerGuesserOptionsFlow(OptionsFlow):
                 # Plan 07-05 (D-06/D-07a/D-12): the full evidence block below the
                 # unchanged candidate label; a row that comes from an unconfirmed
                 # device record is read as a device, never as a pending candidate.
-                "evidence": review_actions.evidence_text(evidence, state),
+                # Plan 09-07: the stored capture insight follows it, advisory only.
+                "evidence": self._append_insight(
+                    review_actions.evidence_text(evidence, state),
+                    review_actions.capture_insight_text(
+                        hub, "candidate", str(self._candidate_id or "")
+                    ),
+                ),
             },
         )
 
@@ -1435,7 +1976,14 @@ class PowerGuesserOptionsFlow(OptionsFlow):
             errors=errors,
             description_placeholders={
                 "candidate": _escape_markdown(label),
-                "warning": warning,
+                # D-11 (Plan 09-07): the stored capture insight joins the warning,
+                # advisory only: it never blocks Confirm.
+                "warning": self._append_insight(
+                    warning,
+                    review_actions.capture_insight_text(
+                        hub, "candidate", str(cand_id or "")
+                    ),
+                ),
             },
         )
 
